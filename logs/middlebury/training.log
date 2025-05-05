@@ -1,0 +1,14 @@
+2025-04-17 15:29:03,069 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 15:29:03,070 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 15:34:29,524 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 15:34:29,525 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 15:36:09,686 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 15:36:09,686 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 20:04:08,469 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 20:04:08,471 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 21:05:04,822 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 21:05:04,824 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 21:07:28,996 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 21:07:28,997 - BPNN_Trainer - INFO - 训练设备: cuda
+2025-04-17 21:26:41,191 - BPNN_Trainer - INFO - 开始训练，总轮次: 50
+2025-04-17 21:26:41,192 - BPNN_Trainer - INFO - 训练设备: cuda

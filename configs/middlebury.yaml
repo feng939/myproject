@@ -1,0 +1,41 @@
+# Middlebury数据集训练配置
+model:
+  type: 'bpnn'
+  max_disp: 64
+  feature_channels: 16  # 减小特征通道以节省内存
+  iterations: 3
+  use_refinement: false
+
+dataset:
+  type: 'middlebury'
+  root_dir: './data/middlebury'
+  augment: true
+  max_disp: 64
+  crop_size: [256, 340]  # 非常小的裁剪尺寸以适应4GB GPU
+  batch_size: 1  # 单个样本训练
+  num_workers: 2  # 减少工作进程
+
+training:
+  num_epochs: 50
+  save_dir: './checkpoints/middlebury'
+  log_dir: './logs/middlebury'
+  save_freq: 5
+  val_freq: 1
+  
+  optimizer:
+    type: 'adam'
+    lr: 0.0005  # 降低学习率
+    weight_decay: 0.0001
+  
+  lr_scheduler:
+    type: 'step'
+    step_size: 15
+    gamma: 0.5
+  
+  loss:
+    smooth_l1_weight: 1.0
+    ssim_weight: 0.1
+    smoothness_weight: 0.05
+    focal_weight: 0.0
+  
+  grad_clip: 1.0  # 较小的梯度裁剪值
