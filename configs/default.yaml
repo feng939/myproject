@@ -4,19 +4,20 @@
 
 # 模型配置
 model:
-  type: 'bpnn'  # 模型类型：'bpnn', 'hierarchical', 或 'dual'
-  max_disp: 32  # 最大视差值
-  feature_channels: 16  # 特征通道数
+  type: 'bpnn'  # 模型类型：'bpnn', 'attention_bpnn'
+  max_disp: 32  # 最大视差值 (降低以节省显存)
+  feature_channels: 16  # 特征通道数 (降低以节省显存)
   iterations: 3  # BP迭代次数
-  use_attention: false  # 是否使用注意力机制
-  use_refinement: false  # 是否使用视差细化
-  # hierarchical模型特有参数
-  num_scales: 3  # 层次级别数
-  scale_factor: 0.5  # 层次缩放因子
+  use_attention: true  # 是否使用注意力机制
+  use_refinement: true  # 是否使用视差细化
+  use_half_precision: true  # 是否使用半精度浮点数
+  # 块处理参数
+  block_size: 64  # BP处理时的块大小
+  overlap: 8  # 块重叠大小
 
 # 数据集配置
 dataset:
-  type: 'middlebury'  # 数据集类型：'middlebury', 'kitti', 'eth3d', 'sceneflow', 或 'custom'
+  type: 'middlebury'  # 数据集类型：'middlebury', 'kitti', 'custom'
   root_dir: './data/middlebury'  # 数据集根目录
   # 对于custom数据集需要的额外参数
   # left_dir: './data/custom/left'
@@ -24,17 +25,14 @@ dataset:
   # disp_dir: './data/custom/disp'
   # split_ratio: [0.7, 0.15, 0.15]  # 训练、验证、测试集比例
   augment: true  # 是否进行数据增强
-  max_disp: 192  # 数据集最大视差值
+  max_disp: 32  # 数据集最大视差值
   resize: [200, 200]  # 数据集图像尺寸 [高度, 宽度]
-  #crop_size: [384, 1280]  # 裁剪尺寸 [高度, 宽度]
   batch_size: 1  # 批大小
-  num_workers: 4  # 数据加载器工作进程数
-  # sceneflow数据集特有参数
-  # subset: 'FlyingThings3D'  # 'FlyingThings3D', 'Monkaa', 或 'Driving'
+  num_workers: 2  # 数据加载器工作进程数
 
 # 训练配置
 training:
-  num_epochs: 100  # 训练轮次
+  num_epochs: 50  # 训练轮次
   save_dir: './checkpoints'  # 保存目录
   log_dir: './logs'  # 日志目录
   save_freq: 5  # 保存频率（每多少轮保存一次）
@@ -44,30 +42,24 @@ training:
   
   # 优化器配置
   optimizer:
-    type: 'adam'  # 优化器类型：'adam', 'sgd', 或 'rmsprop'
-    lr: 0.001  # 学习率
+    type: 'adam'  # 优化器类型：'adam', 'sgd'
+    lr: 0.0005  # 学习率
     weight_decay: 0.0001  # 权重衰减
     # 对于不同优化器的特定参数
     betas: [0.9, 0.999]  # Adam优化器的beta参数
-    # momentum: 0.9  # SGD和RMSprop优化器的动量
+    # momentum: 0.9  # SGD优化器的动量
   
   # 学习率调整器配置
   lr_scheduler:
-    type: 'step'  # 调整器类型：'step', 'plateau', 或 'cosine'
-    step_size: 20  # Step调整器的步长
+    type: 'step'  # 调整器类型：'step', 'plateau'
+    step_size: 15  # Step调整器的步长
     gamma: 0.5  # 学习率衰减系数
-    # 对于不同调整器的特定参数
-    # factor: 0.5  # Plateau调整器的减小因子
-    # patience: 5  # Plateau调整器的等待轮次
-    # T_max: 10  # Cosine调整器的最大周期
-    # eta_min: 0  # Cosine调整器的最小学习率
   
   # 损失函数配置
   loss:
     smooth_l1_weight: 1.0  # 平滑L1损失权重
     ssim_weight: 0.1  # SSIM损失权重
     smoothness_weight: 0.1  # 平滑损失权重
-    focal_weight: 0.0  # 焦点损失权重
   
   # 其他训练参数
-  grad_clip: 5.0  # 梯度裁剪阈值
+  grad_clip: 1.0  # 梯度裁剪阈值

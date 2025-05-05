@@ -16,72 +16,51 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import psutil
 import gc
-from tqdm import tqdm
 import pandas as pd
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.bpnn import BPNN, HierarchicalBPNN, DualBPNN
+from src.models.bpnn import BPNN
 from src.inference.predict import DisparityPredictor
 from src.utils.visualization import colorize_disparity
-from src.data.dataset import get_data_loaders
 
 
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='BPNN性能基准测试')
-    parser.add_argument('--config', type=str, default=None,
-                       help='配置文件路径')
     parser.add_argument('--model_path', type=str, default=None,
                        help='模型路径')
-    parser.add_argument('--dataset_path', type=str, default=None,
-                       help='数据集路径')
-    parser.add_argument('--dataset_type', type=str, default='middlebury',
-                       choices=['middlebury', 'kitti', 'eth3d', 'custom'],
-                       help='数据集类型')
-    parser.add_argument('--model_type', type=str, default='bpnn',
-                       choices=['bpnn', 'hierarchical', 'dual'],
-                       help='模型类型')
-    parser.add_argument('--max_disp', type=int, default=64,
+    parser.add_argument('--left', type=str, required=True,
+                       help='左图像路径')
+    parser.add_argument('--right', type=str, required=True,
+                       help='右图像路径')
+    parser.add_argument('--max_disp', type=int, default=32,
                        help='最大视差值')
-    parser.add_argument('--num_samples', type=int, default=10,
-                       help='测试样本数量')
     parser.add_argument('--output', type=str, default='benchmark_results.csv',
                        help='结果输出路径')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU ID，-1表示使用CPU')
     parser.add_argument('--visualize', action='store_true',
                        help='可视化处理结果')
+    parser.add_argument('--use_attention', action='store_true',
+                       help='使用注意力机制')
     parser.add_argument('--resolution_test', action='store_true',
                        help='测试不同分辨率')
     
     return parser.parse_args()
 
 
-def create_model(model_type, max_disp):
+def create_model(max_disp, use_attention):
     """创建模型"""
-    if model_type == 'hierarchical':
-        model = HierarchicalBPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            num_scales=3,
-            scale_factor=0.5
-        )
-    elif model_type == 'dual':
-        model = DualBPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            iterations=5
-        )
-    else:  # 默认BPNN
-        model = BPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            iterations=5,
-            use_attention=False,
-            use_refinement=True
-        )
+    model = BPNN(
+        max_disp=max_disp,
+        feature_channels=16,
+        iterations=3,
+        use_attention=use_attention,
+        use_refinement=True,
+        use_half_precision=True
+    )
     
     return model
 
@@ -114,21 +93,25 @@ def get_memory_usage():
     return system_memory, torch_memory
 
 
-def run_benchmark(model, test_loader, device, num_samples, visualize=False):
+def run_benchmark(model, left_img, right_img, device, num_runs=10, visualize=False):
     """
     运行基准测试
     
     参数:
         model: 模型
-        test_loader: 测试数据加载器
+        left_img: 左图像
+        right_img: 右图像
         device: 计算设备
-        num_samples: 测试样本数量
+        num_runs: 运行次数
         visualize: 是否可视化结果
     
     返回:
         dict: 包含性能指标的字典
     """
     model.eval()
+    
+    # 创建预测器
+    predictor = DisparityPredictor(model=model, device=device)
     
     # 初始化性能指标
     processing_times = []
@@ -142,77 +125,54 @@ def run_benchmark(model, test_loader, device, num_samples, visualize=False):
     # 测量初始内存
     initial_system_memory, initial_torch_memory = get_memory_usage()
     
-    # 遍历测试样本
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_loader, desc="基准测试中")):
-            if i >= num_samples:
-                break
-            
-            # 准备数据
-            left_img = batch['left'].to(device)
-            right_img = batch['right'].to(device)
-            
-            # 测量内存
-            before_system_memory, before_torch_memory = get_memory_usage()
-            
-            # 测量处理时间
-            start_time = time.time()
-            
-            # 前向传播
-            outputs = model(left_img, right_img)
-            
-            # 如果模型返回字典，提取视差图
-            if isinstance(outputs, dict) and 'disparity' in outputs:
-                pred_disp = outputs['disparity']
-            else:
-                pred_disp = outputs
-            
-            # 同步GPU（如果使用）
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            # 记录处理时间
-            processing_time = time.time() - start_time
-            processing_times.append(processing_time)
-            
-            # 测量内存
-            after_system_memory, after_torch_memory = get_memory_usage()
-            memory_usage = {
-                'system_diff': after_system_memory - before_system_memory,
-                'torch_diff': after_torch_memory - before_torch_memory,
-                'system_total': after_system_memory,
-                'torch_total': after_torch_memory
-            }
-            memory_usages.append(memory_usage)
-            
-            # 可视化（如果需要）
-            if visualize:
-                # 将tensor转换为numpy
-                pred_np = pred_disp[0].squeeze().cpu().numpy()
-                left_np = batch['left'][0].permute(1, 2, 0).cpu().numpy()
-                
-                # 如果值在0-1范围，转换为0-255
-                if left_np.max() <= 1.0:
-                    left_np = (left_np * 255).astype(np.uint8)
-                
-                # 生成彩色视差图
-                color_pred = colorize_disparity(pred_np)
-                
-                # 显示结果
-                plt.figure(figsize=(12, 6))
-                
-                plt.subplot(1, 2, 1)
-                plt.imshow(left_np)
-                plt.title('输入左图像')
-                plt.axis('off')
-                
-                plt.subplot(1, 2, 2)
-                plt.imshow(color_pred)
-                plt.title('预测视差图')
-                plt.axis('off')
-                
-                plt.tight_layout()
-                plt.show()
+    # 预热
+    _ = predictor.predict(left_img, right_img)
+    
+    # 进行多次测试
+    for i in range(num_runs):
+        # 测量内存
+        before_system_memory, before_torch_memory = get_memory_usage()
+        
+        # 进行预测
+        start_time = time.time()
+        result = predictor.predict(left_img, right_img)
+        disparity = result['disparity']
+        end_time = time.time()
+        
+        # 记录处理时间
+        processing_time = end_time - start_time
+        processing_times.append(processing_time)
+        
+        # 测量内存
+        after_system_memory, after_torch_memory = get_memory_usage()
+        memory_usage = {
+            'system_diff': after_system_memory - before_system_memory,
+            'torch_diff': after_torch_memory - before_torch_memory,
+            'system_total': after_system_memory,
+            'torch_total': after_torch_memory
+        }
+        memory_usages.append(memory_usage)
+    
+    # 可视化（如果需要）
+    if visualize:
+        # 生成彩色视差图
+        color_pred = colorize_disparity(disparity)
+        
+        # 显示结果
+        plt.figure(figsize=(12, 6))
+        
+        plt.subplot(1, 2, 1)
+        plt.imshow(left_img)
+        plt.title('输入左图像')
+        plt.axis('off')
+        
+        plt.subplot(1, 2, 2)
+        plt.imshow(color_pred)
+        plt.title('预测视差图')
+        plt.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
     
     # 计算平均性能指标
     avg_time = sum(processing_times) / len(processing_times)
@@ -240,33 +200,32 @@ def run_benchmark(model, test_loader, device, num_samples, visualize=False):
         'max_torch_memory': max_torch_memory
     }
     
-    return results
+    return results, disparity
 
 
-def test_resolution_scaling(model, sample_pair, device, resolutions=None):
+def test_resolution_scaling(model, left_img, right_img, device, resolutions=None):
     """
     测试不同分辨率的性能
     
     参数:
         model: 模型
-        sample_pair: (左图像, 右图像)元组
+        left_img: 左图像
+        right_img: 右图像
         device: 计算设备
         resolutions: 要测试的分辨率列表
     
     返回:
-        dict: 包含不同分辨率性能指标的字典
+        list: 包含不同分辨率性能指标的列表
     """
     if resolutions is None:
         # 默认测试分辨率
         resolutions = [
+            (120, 160),    # 非常小
+            (180, 240),    # 小
+            (200, 200),    # 默认配置
             (240, 320),    # QVGA
-            (480, 640),    # VGA
-            (720, 1280),   # 720p HD
-            (1080, 1920)   # 1080p Full HD
+            (480, 640),    # VGA（可能在较小显存下仍然可行）
         ]
-    
-    # 提取原始图像
-    left_img, right_img = sample_pair
     
     # 初始化结果
     resolution_results = []
@@ -278,66 +237,42 @@ def test_resolution_scaling(model, sample_pair, device, resolutions=None):
         left_resized = cv2.resize(left_img, (width, height))
         right_resized = cv2.resize(right_img, (width, height))
         
-        # 转换为张量
-        left_tensor = torch.from_numpy(left_resized.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
-        right_tensor = torch.from_numpy(right_resized.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
-        
-        # 归一化（如果需要）
-        if left_tensor.max() > 1.0:
-            left_tensor = left_tensor / 255.0
-        if right_tensor.max() > 1.0:
-            right_tensor = right_tensor / 255.0
+        # 创建预测器并指定目标大小
+        predictor = DisparityPredictor(
+            model=model, 
+            device=device,
+            target_size=(height, width)
+        )
         
         # 清理内存
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # 测量内存和时间
-        with torch.no_grad():
-            # 测量初始内存
-            initial_system_memory, initial_torch_memory = get_memory_usage()
-            
-            # 预热
-            model(left_tensor, right_tensor)
-            
-            # 运行多次并测量时间
-            num_runs = 5
-            times = []
-            
-            for _ in range(num_runs):
-                # 测量处理时间
-                start_time = time.time()
-                
-                # 前向传播
-                model(left_tensor, right_tensor)
-                
-                # 同步GPU（如果使用）
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
-                # 记录处理时间
-                times.append(time.time() - start_time)
-            
-            # 测量最终内存
-            final_system_memory, final_torch_memory = get_memory_usage()
+        # 预热
+        _ = predictor.predict(left_img, right_img)
         
-        # 计算结果
-        avg_time = sum(times) / len(times)
-        fps = 1.0 / avg_time
-        memory_diff = (final_system_memory - initial_system_memory) + (final_torch_memory - initial_torch_memory)
+        # 测量性能
+        start_time = time.time()
+        result = predictor.predict(left_img, right_img)
+        processing_time = result['processing_time']
+        
+        # 测量内存
+        _, torch_memory = get_memory_usage()
+        
+        # 计算FPS
+        fps = 1.0 / processing_time
         
         # 添加到结果
-        result = {
+        resolution_results.append({
             'height': height,
             'width': width,
             'resolution': f"{height}x{width}",
             'pixels': height * width,
-            'avg_time': avg_time,
+            'time': processing_time,
             'fps': fps,
-            'memory_diff': memory_diff
-        }
-        resolution_results.append(result)
+            'memory': torch_memory
+        })
     
     return resolution_results
 
@@ -354,8 +289,9 @@ def main():
     print(f"使用设备: {device}")
     
     # 创建模型
-    model = create_model(args.model_type, args.max_disp)
-    print(f"模型类型: {args.model_type}")
+    model = create_model(args.max_disp, args.use_attention)
+    print(f"最大视差: {args.max_disp}")
+    print(f"使用注意力: {args.use_attention}")
     
     # 加载模型权重
     if args.model_path:
@@ -370,59 +306,13 @@ def main():
     # 设置模型为评估模式
     model.eval()
     
+    # 加载图像
+    left_img = np.array(Image.open(args.left).convert('RGB'))
+    right_img = np.array(Image.open(args.right).convert('RGB'))
+    
     if args.resolution_test:
-        # 为分辨率测试加载样本图像
-        print("加载样本图像用于分辨率测试...")
-        
-        # 查找样本图像
-        if args.dataset_path:
-            # 尝试从数据集中找到样本
-            sample_found = False
-            
-            # 尝试查找常见的测试图像目录结构
-            test_paths = [
-                os.path.join(args.dataset_path, 'test'),
-                os.path.join(args.dataset_path, 'testing'),
-                os.path.join(args.dataset_path, 'val'),
-                os.path.join(args.dataset_path, 'validation'),
-                args.dataset_path
-            ]
-            
-            for test_path in test_paths:
-                if os.path.exists(test_path):
-                    # 查找图像文件
-                    for root, _, files in os.walk(test_path):
-                        image_files = [f for f in files if f.endswith(('.png', '.jpg', '.jpeg'))]
-                        if len(image_files) >= 2:
-                            # 假设前两个图像是左右图像对
-                            left_img_path = os.path.join(root, image_files[0])
-                            right_img_path = os.path.join(root, image_files[1])
-                            
-                            left_img = np.array(Image.open(left_img_path).convert('RGB'))
-                            right_img = np.array(Image.open(right_img_path).convert('RGB'))
-                            
-                            sample_pair = (left_img, right_img)
-                            sample_found = True
-                            break
-                
-                if sample_found:
-                    break
-            
-            if not sample_found:
-                # 如果无法找到样本，使用随机生成的图像
-                print("无法从数据集中找到样本图像，使用随机生成的图像")
-                left_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-                right_img = np.roll(left_img, shift=-20, axis=1)  # 简单移位模拟视差
-                sample_pair = (left_img, right_img)
-        else:
-            # 使用随机生成的图像
-            print("使用随机生成的图像")
-            left_img = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-            right_img = np.roll(left_img, shift=-20, axis=1)  # 简单移位模拟视差
-            sample_pair = (left_img, right_img)
-        
         # 运行分辨率测试
-        resolution_results = test_resolution_scaling(model, sample_pair, device)
+        resolution_results = test_resolution_scaling(model, left_img, right_img, device)
         
         # 创建结果DataFrame
         df = pd.DataFrame(resolution_results)
@@ -441,9 +331,9 @@ def main():
         
         # 绘制处理时间与分辨率关系
         plt.subplot(2, 1, 1)
-        plt.plot(df['pixels'], df['avg_time'], 'o-', linewidth=2)
+        plt.plot(df['pixels'], df['time'], 'o-', linewidth=2)
         plt.title('处理时间与分辨率关系')
-        plt.xlabel('像素数（百万）')
+        plt.xlabel('像素数')
         plt.ylabel('处理时间（秒）')
         plt.grid(True)
         
@@ -451,7 +341,7 @@ def main():
         plt.subplot(2, 1, 2)
         plt.plot(df['pixels'], df['fps'], 'o-', linewidth=2)
         plt.title('帧率与分辨率关系')
-        plt.xlabel('像素数（百万）')
+        plt.xlabel('像素数')
         plt.ylabel('帧率（FPS）')
         plt.grid(True)
         
@@ -467,30 +357,14 @@ def main():
     
     else:
         # 标准性能测试
-        # 创建数据集配置
-        dataset_config = {
-            'type': args.dataset_type,
-            'root_dir': args.dataset_path,
-            'batch_size': 1,
-            'num_workers': 4
-        }
-        
-        # 加载数据
-        _, _, test_loader = get_data_loaders(dataset_config)
-        
-        if test_loader is None or len(test_loader) == 0:
-            print("无法加载测试数据，请检查数据集路径和类型")
-            return
-        
-        print(f"数据集: {args.dataset_type}")
-        print(f"测试集大小: {len(test_loader.dataset)}")
+        print("运行标准性能测试...")
         
         # 运行基准测试
-        results = run_benchmark(
+        results, disparity = run_benchmark(
             model=model,
-            test_loader=test_loader,
+            left_img=left_img,
+            right_img=right_img,
             device=device,
-            num_samples=min(args.num_samples, len(test_loader)),
             visualize=args.visualize
         )
         
@@ -509,9 +383,8 @@ def main():
         
         # 创建结果字典
         result_dict = {
-            'model_type': args.model_type,
+            'model_type': 'bpnn_attention' if args.use_attention else 'bpnn',
             'max_disp': args.max_disp,
-            'dataset': args.dataset_type,
             'device': device.type,
             'avg_time': results['avg_time'],
             'min_time': results['min_time'],

@@ -18,10 +18,9 @@ from flask import Flask, render_template, request, jsonify
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.bpnn import BPNN, HierarchicalBPNN, DualBPNN
+from src.models.bpnn import BPNN
 from src.inference.predict import DisparityPredictor
 from src.utils.visualization import colorize_disparity, create_anaglyph
-from src.data.preprocessing import preprocess_for_prediction, postprocess_disparity
 
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
@@ -30,14 +29,14 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 model = None
 predictor = None
 config = {
-    'max_disp': 64,
-    'feature_channels': 32,
-    'iterations': 5,
-    'use_attention': False,
+    'max_disp': 32,
+    'feature_channels': 16,
+    'iterations': 3,
+    'use_attention': True,
     'use_refinement': True,
-    'model_type': 'bpnn',  # 'bpnn', 'hierarchical', 'dual'
+    'use_half_precision': True,
     'model_path': None,
-    'target_size': None  # 目标大小，例如(384, 1280)
+    'target_size': (200, 200)  # 目标大小
 }
 
 
@@ -48,29 +47,15 @@ def load_model():
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 根据配置创建模型
-    model_type = config['model_type'].lower()
-    
-    if model_type == 'hierarchical':
-        model = HierarchicalBPNN(
-            max_disp=config['max_disp'],
-            feature_channels=config['feature_channels'],
-            num_scales=3
-        )
-    elif model_type == 'dual':
-        model = DualBPNN(
-            max_disp=config['max_disp'],
-            feature_channels=config['feature_channels'],
-            iterations=config['iterations']
-        )
-    else:  # 默认BPNN
-        model = BPNN(
-            max_disp=config['max_disp'],
-            feature_channels=config['feature_channels'],
-            iterations=config['iterations'],
-            use_attention=config['use_attention'],
-            use_refinement=config['use_refinement']
-        )
+    # 创建模型
+    model = BPNN(
+        max_disp=config['max_disp'],
+        feature_channels=config['feature_channels'],
+        iterations=config['iterations'],
+        use_attention=config['use_attention'],
+        use_refinement=config['use_refinement'],
+        use_half_precision=config['use_half_precision']
+    )
     
     # 加载模型权重（如果有）
     if config['model_path'] and os.path.exists(config['model_path']):
@@ -80,6 +65,13 @@ def load_model():
         else:
             model.load_state_dict(checkpoint)
     
+    # 先将模型移动到设备
+    model = model.to(device)
+    
+    # 如果启用半精度，立即转换模型
+    if config['use_half_precision'] and device.type == 'cuda':
+        model = model.half()
+
     # 设置为评估模式
     model.eval()
     
@@ -213,14 +205,24 @@ def load_model_route():
     # 获取模型信息
     data = request.json
     model_path = data.get('model_path')
-    model_type = data.get('model_type', 'bpnn')
-    max_disp = int(data.get('max_disp', 64))
-    iterations = int(data.get('iterations', 5))
+    use_attention = data.get('use_attention', True)
+    max_disp = int(data.get('max_disp', 32))
+    iterations = int(data.get('iterations', 3))
     use_refinement = data.get('use_refinement', True)
     
+    # 构造完整的模型路径
+    if model_path:
+        full_model_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+            'checkpoints', 
+            model_path
+        )
+    else:
+        full_model_path = None
+    
     # 更新配置
-    config['model_path'] = model_path
-    config['model_type'] = model_type
+    config['model_path'] = full_model_path
+    config['use_attention'] = use_attention
     config['max_disp'] = max_disp
     config['iterations'] = iterations
     config['use_refinement'] = use_refinement
@@ -249,7 +251,12 @@ def benchmark():
     try:
         # 预处理图像
         left_img = preprocess_image(left_file)
-        right_img = preprocess_image(right_img)
+        right_img = preprocess_image(right_file)
+        
+        # 确保左右图像尺寸一致
+        if left_img.shape[:2] != right_img.shape[:2]:
+            # 将右图像调整为左图像大小
+            right_img = cv2.resize(right_img, (left_img.shape[1], left_img.shape[0]))
         
         # 执行多次预测以测试性能
         num_tests = 5

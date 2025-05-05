@@ -9,44 +9,170 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .neural_net import (
-    FeatureExtractorNetwork,
-    CostVolumeNetwork,
-    MessagePassingNetwork,
-    DisparityRefinementNetwork,
-    AttentionGuidedMessagePassing
-)
+
+class FeatureExtractorNetwork(nn.Module):
+    """特征提取网络"""
+    
+    def __init__(self, in_channels=3, base_channels=16):
+        super(FeatureExtractorNetwork, self).__init__()
+        
+        # 轻量级特征提取网络
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        """前向传播"""
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
 
 
-class BPNN(nn.Module):
-    """
-    信念传播神经网络（BPNN）模型
+class CostVolumeNetwork(nn.Module):
+    """代价体计算网络 - 优化显存使用"""
     
-    结合了神经网络特征提取和信念传播算法的端到端可学习的模型。
-    """
+    def __init__(self, in_channels, max_disp):
+        super(CostVolumeNetwork, self).__init__()
+        self.max_disp = max_disp
+        
+        # 减少通道数的卷积层
+        self.cost_conv = nn.Sequential(
+            nn.Conv3d(in_channels*2, 16, kernel_size=3, padding=1),
+            nn.BatchNorm3d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(16, 1, kernel_size=3, padding=1)
+        )
     
-    def __init__(self, max_disp=64, feature_channels=32, iterations=5, 
-                use_attention=False, use_refinement=True):
+    def forward(self, left_feature, right_feature):
         """
-        初始化BPNN模型
+        前向传播 - 分块处理代价体以减少显存使用
+        
+        参数:
+            left_feature (torch.Tensor): 左图像特征
+            right_feature (torch.Tensor): 右图像特征
+            
+        返回:
+            torch.Tensor: 代价体
+        """
+        batch_size, channels, height, width = left_feature.shape
+        
+        # 分块计算代价体，以节省内存
+        cost_list = []
+        
+        # 每次处理8个视差
+        for d_start in range(0, self.max_disp, 8):
+            d_end = min(d_start + 8, self.max_disp)
+            d_range = d_end - d_start
+            
+            # 初始化当前块的代价体
+            cost_block = torch.zeros((batch_size, channels*2, d_range, height, width), 
+                                    device=left_feature.device)
+            
+            # 填充代价体块
+            for d_idx, d in enumerate(range(d_start, d_end)):
+                if d > 0:
+                    # 沿x轴偏移右图像特征
+                    shifted_right = torch.zeros_like(right_feature)
+                    shifted_right[:, :, :, 0:width-d] = right_feature[:, :, :, d:width]
+                else:
+                    shifted_right = right_feature
+                
+                # 连接左右特征
+                cost_block[:, :channels, d_idx, :, :] = left_feature
+                cost_block[:, channels:, d_idx, :, :] = shifted_right
+            
+            # 应用卷积层
+            processed_block = self.cost_conv(cost_block)
+            cost_list.append(processed_block)
+        
+        # 合并所有块
+        cost_volume = torch.cat(cost_list, dim=2)
+        
+        return cost_volume
+
+
+class SelfAttentionModule(nn.Module):
+    """自注意力模块 - 用于增强重要特征"""
+    
+    def __init__(self, in_channels):
+        super(SelfAttentionModule, self).__init__()
+        
+        # 降维以节省计算资源
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 2, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        
+        self.gamma = nn.Parameter(torch.zeros(1))  # 控制注意力的强度
+    
+    def forward(self, x):
+        """前向传播"""
+        batch_size, C, H, W = x.shape
+        
+        # 计算查询、键、值
+        query = self.query_conv(x).view(batch_size, -1, H * W).permute(0, 2, 1)  # B, HW, C//2
+        key = self.key_conv(x).view(batch_size, -1, H * W)  # B, C//2, HW
+        value = self.value_conv(x).view(batch_size, -1, H * W)  # B, C, HW
+        
+        # 计算注意力图
+        energy = torch.bmm(query, key)  # B, HW, HW
+        attention = F.softmax(energy / (C ** 0.5), dim=2)  # 缩放点积注意力
+        
+        # 应用注意力
+        out = torch.bmm(value, attention.permute(0, 2, 1))  # B, C, HW
+        out = out.view(batch_size, C, H, W)
+        
+        # 残差连接
+        out = self.gamma * out + x
+        
+        return out
+
+
+class AttentionBPNN(nn.Module):
+    """
+    注意力增强的信念传播神经网络
+    
+    使用自注意力机制来加强BP过程中的特征表示和消息传递。
+    """
+    
+    def __init__(self, max_disp=32, feature_channels=16, iterations=3, 
+                use_refinement=True, use_half_precision=True,
+                block_size=64, overlap=8):
+        """
+        初始化注意力增强的BPNN模型
         
         参数:
             max_disp (int): 最大视差值
             feature_channels (int): 特征通道数
-            iterations (int): 消息传递迭代次数
-            use_attention (bool): 是否使用注意力引导的消息传递
-            use_refinement (bool): 是否使用视差细化网络
+            iterations (int): BP迭代次数
+            use_refinement (bool): 是否使用视差细化
+            use_half_precision (bool): 是否使用半精度浮点数
+            block_size (int): BP处理时的块大小
+            overlap (int): 块重叠大小
         """
-        super(BPNN, self).__init__()
+        super(AttentionBPNN, self).__init__()
         self.max_disp = max_disp
         self.iterations = iterations
         self.use_refinement = use_refinement
+        self.use_half_precision = use_half_precision
+        self.block_size = block_size
+        self.overlap = overlap
         
-        # 特征提取网络（左右图像共享权重）
+        # 特征提取网络
         self.feature_extractor = FeatureExtractorNetwork(
             in_channels=3, 
             base_channels=feature_channels
         )
+        
+        # 自注意力模块
+        self.attention = SelfAttentionModule(feature_channels)
         
         # 代价体计算网络
         self.cost_volume_net = CostVolumeNetwork(
@@ -54,59 +180,300 @@ class BPNN(nn.Module):
             max_disp=max_disp
         )
         
-        # 消息传递网络（选择使用标准或注意力引导的消息传递）
-        if use_attention:
-            self.message_passing = AttentionGuidedMessagePassing(
-                feature_channels=feature_channels, 
-                hidden_channels=64
-            )
-        else:
-            self.message_passing = MessagePassingNetwork(
-                feature_channels=feature_channels, 
-                hidden_channels=64
-            )
-        
-        # 视差细化网络（可选）
-        if use_refinement:
-            self.refinement = DisparityRefinementNetwork(in_channels=4)
-        
-    def estimate_disparity(self, cost_volume):
-        """
-        从代价体估计视差图
-        
-        参数:
-            cost_volume (torch.Tensor): 代价体，形状为 [B, 1, D, H, W]
-            
-        返回:
-            torch.Tensor: 视差图，形状为 [B, 1, H, W]
-        """
-        # 对D维度求softmax，使其成为概率分布
-        prob_volume = F.softmax(-cost_volume, dim=2)
-        
-        # 创建视差索引，形状为 [D]
-        disp_indices = torch.arange(
-            0, self.max_disp, device=cost_volume.device, dtype=torch.float32
+        # BP消息传递网络的四个方向卷积
+        self.msg_up = nn.Sequential(
+            nn.Conv2d(feature_channels + 1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
         )
         
-        # 扩展视差索引的形状为 [B, 1, D, H, W]
-        disp_indices = disp_indices.view(1, 1, self.max_disp, 1, 1).expand_as(prob_volume)
+        self.msg_down = nn.Sequential(
+            nn.Conv2d(feature_channels + 1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        )
         
-        # 计算期望视差（加权和）
-        disparity = torch.sum(disp_indices * prob_volume, dim=2, keepdim=False)
+        self.msg_left = nn.Sequential(
+            nn.Conv2d(feature_channels + 1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        )
         
-        return disparity
+        self.msg_right = nn.Sequential(
+            nn.Conv2d(feature_channels + 1, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        )
+        
+        # 信念更新网络
+        self.belief_update = nn.Sequential(
+            nn.Conv2d(5, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        )
+        
+        # 视差细化网络
+        if use_refinement:
+            self.refinement = nn.Sequential(
+                nn.Conv2d(4, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, kernel_size=3, padding=1)
+            )
     
     def forward(self, left_img, right_img):
         """
         前向传播
         
         参数:
-            left_img (torch.Tensor): 左图像，形状为 [B, C, H, W]
-            right_img (torch.Tensor): 右图像，形状为 [B, C, H, W]
+            left_img (torch.Tensor): 左图像
+            right_img (torch.Tensor): 右图像
             
         返回:
-            dict: 包含视差估计和中间结果的字典
+            dict: 包含视差估计的字典
         """
+        # 使用半精度浮点数以节省显存
+        if self.use_half_precision and left_img.is_cuda:
+            left_img = left_img.half()
+            right_img = right_img.half()
+            self.to(torch.float16)
+        
+        # 特征提取
+        left_feature = self.feature_extractor(left_img)
+        right_feature = self.feature_extractor(right_img)
+        
+        # 应用自注意力
+        left_feature = self.attention(left_feature)
+        
+        # 构建代价体
+        cost_volume = self.cost_volume_net(left_feature, right_feature)
+        
+        # 分块BP处理以节省显存
+        _, _, _, height, width = cost_volume.shape
+        
+        # 将处理分成多个块
+        h_blocks = (height + self.block_size - 1) // self.block_size
+        w_blocks = (width + self.block_size - 1) // self.block_size
+        
+        # 初始化输出视差图
+        disparity = torch.zeros((left_img.shape[0], 1, height, width), device=left_img.device)
+        
+        for h_idx in range(h_blocks):
+            for w_idx in range(w_blocks):
+                # 计算当前块的范围（带重叠区域）
+                h_start = max(0, h_idx * self.block_size - self.overlap)
+                h_end = min(height, (h_idx + 1) * self.block_size + self.overlap)
+                w_start = max(0, w_idx * self.block_size - self.overlap)
+                w_end = min(width, (w_idx + 1) * self.block_size + self.overlap)
+                
+                # 提取特征块
+                feat_block = left_feature[:, :, h_start:h_end, w_start:w_end]
+                cost_block = cost_volume[:, :, :, h_start:h_end, w_start:w_end]
+                
+                # 信念传播处理
+                disp_block = self._process_block(feat_block, cost_block)
+                
+                # 计算有效区域（去除重叠部分）
+                valid_h_start = 0 if h_idx == 0 else self.overlap
+                valid_h_end = h_end - h_start if h_idx == h_blocks - 1 else min(h_end - h_start, (h_idx + 1) * self.block_size - h_start)
+                valid_w_start = 0 if w_idx == 0 else self.overlap
+                valid_w_end = w_end - w_start if w_idx == w_blocks - 1 else min(w_end - w_start, (w_idx + 1) * self.block_size - w_start)
+                
+                # 填充到输出视差图
+                h_offset = h_idx * self.block_size
+                w_offset = w_idx * self.block_size
+                output_h_start = max(0, h_offset)
+                output_h_end = min(height, h_offset + valid_h_end - valid_h_start)
+                output_w_start = max(0, w_offset)
+                output_w_end = min(width, w_offset + valid_w_end - valid_w_start)
+                
+                disparity[:, :, output_h_start:output_h_end, output_w_start:output_w_end] = \
+                    disp_block[:, :, valid_h_start:valid_h_end, valid_w_start:valid_w_end]
+        
+        # 视差细化（如果需要）
+        if self.use_refinement:
+            # 将原始图像与视差连接起来
+            refined_input = torch.cat([left_img, disparity], dim=1)
+            residual = self.refinement(refined_input)
+            disparity = disparity + residual
+        
+        # 恢复为单精度（如有必要）
+        if self.use_half_precision and disparity.is_cuda:
+            disparity = disparity.float()
+            self.to(torch.float32)
+        
+        return {'disparity': disparity}
+    
+    def _process_block(self, feature_block, cost_block):
+        """
+        处理一个块的信念传播
+        
+        参数:
+            feature_block (torch.Tensor): 特征块
+            cost_block (torch.Tensor): 代价块
+            
+        返回:
+            torch.Tensor: 该块的视差估计
+        """
+        batch_size, _, max_disp, height, width = cost_block.shape
+        
+        # 初始化视差图
+        disparity = torch.zeros((batch_size, 1, height, width), device=feature_block.device)
+        
+        # 对每个视差平面进行BP处理
+        for d in range(max_disp):
+            # 提取当前视差平面的代价
+            cost = cost_block[:, :, d]
+            
+            # 信念传播
+            belief = self._belief_propagation(feature_block, cost)
+            
+            # 更新视差图（根据最小代价）
+            disparity = torch.where(belief < disparity, torch.full_like(disparity, d), disparity)
+        
+        return disparity
+    
+    def _belief_propagation(self, feature, cost):
+        """
+        执行信念传播
+        
+        参数:
+            feature (torch.Tensor): 特征图
+            cost (torch.Tensor): 代价图
+            
+        返回:
+            torch.Tensor: 更新后的信念
+        """
+        batch_size, _, height, width = feature.shape
+        
+        # 初始化消息为零
+        msg_up = torch.zeros_like(cost)
+        msg_down = torch.zeros_like(cost)
+        msg_left = torch.zeros_like(cost)
+        msg_right = torch.zeros_like(cost)
+        
+        # 迭代BP
+        for _ in range(self.iterations):
+            # 更新消息 (UP)
+            for i in range(1, height):
+                # 附加特征信息
+                msg_input = torch.cat([feature[:, :, i-1:i, :], 
+                                     cost[:, :, i:i+1, :] + msg_down[:, :, i-1:i, :] + 
+                                     msg_left[:, :, i:i+1, 1:] + msg_right[:, :, i:i+1, :-1]], dim=1)
+                msg_up[:, :, i-1:i, :] = self.msg_up(msg_input)
+            
+            # 更新消息 (DOWN)
+            for i in range(height - 2, -1, -1):
+                msg_input = torch.cat([feature[:, :, i+1:i+2, :], 
+                                     cost[:, :, i:i+1, :] + msg_up[:, :, i+1:i+2, :] + 
+                                     msg_left[:, :, i:i+1, 1:] + msg_right[:, :, i:i+1, :-1]], dim=1)
+                msg_down[:, :, i+1:i+2, :] = self.msg_down(msg_input)
+            
+            # 更新消息 (LEFT)
+            for j in range(1, width):
+                msg_input = torch.cat([feature[:, :, :, j-1:j], 
+                                     cost[:, :, :, j:j+1] + msg_up[:, :, 1:, j:j+1] + 
+                                     msg_down[:, :, :-1, j:j+1] + msg_right[:, :, :, j-1:j]], dim=1)
+                msg_left[:, :, :, j-1:j] = self.msg_left(msg_input)
+            
+            # 更新消息 (RIGHT)
+            for j in range(width - 2, -1, -1):
+                msg_input = torch.cat([feature[:, :, :, j+1:j+2], 
+                                     cost[:, :, :, j:j+1] + msg_up[:, :, 1:, j:j+1] + 
+                                     msg_down[:, :, :-1, j:j+1] + msg_left[:, :, :, j+1:j+2]], dim=1)
+                msg_right[:, :, :, j+1:j+2] = self.msg_right(msg_input)
+        
+        # 计算最终信念
+        belief_input = torch.cat([cost, msg_up, msg_down, msg_left, msg_right], dim=1)
+        belief = self.belief_update(belief_input)
+        
+        return belief
+
+
+class BPNN(nn.Module):
+    """
+    基础信念传播神经网络
+    
+    简化的BPNN模型，不使用注意力机制，适用于极小显存设备。
+    """
+    
+    def __init__(self, max_disp=32, feature_channels=16, iterations=3, 
+                use_attention=False, use_refinement=True, use_half_precision=True,
+                block_size=64, overlap=8):
+        """
+        初始化BPNN模型
+        
+        参数同AttentionBPNN，但忽略attention参数
+        """
+        super(BPNN, self).__init__()
+        
+        # 如果启用了注意力，使用AttentionBPNN
+        if use_attention:
+            self.model = AttentionBPNN(
+                max_disp=max_disp,
+                feature_channels=feature_channels,
+                iterations=iterations,
+                use_refinement=use_refinement,
+                use_half_precision=use_half_precision,
+                block_size=block_size,
+                overlap=overlap
+            )
+        else:
+            # 创建一个不带注意力的简化模型
+            self.max_disp = max_disp
+            self.iterations = iterations
+            self.use_refinement = use_refinement
+            self.use_half_precision = use_half_precision
+            self.block_size = block_size
+            self.overlap = overlap
+            
+            # 特征提取网络
+            self.feature_extractor = FeatureExtractorNetwork(
+                in_channels=3, 
+                base_channels=feature_channels
+            )
+            
+            # 代价体计算网络
+            self.cost_volume_net = CostVolumeNetwork(
+                in_channels=feature_channels, 
+                max_disp=max_disp
+            )
+            
+            # 简化的消息传递卷积（所有方向共享权重）
+            self.msg_pass = nn.Sequential(
+                nn.Conv2d(feature_channels + 1, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, kernel_size=3, padding=1)
+            )
+            
+            # 简化的信念更新网络
+            self.belief_update = nn.Sequential(
+                nn.Conv2d(5, 16, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(16, 1, kernel_size=3, padding=1)
+            )
+            
+            # 视差细化网络
+            if use_refinement:
+                self.refinement = nn.Sequential(
+                    nn.Conv2d(4, 16, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(16, 1, kernel_size=3, padding=1)
+                )
+    
+    def forward(self, left_img, right_img):
+        """前向传播"""
+        # 使用注意力模型
+        if hasattr(self, 'model'):
+            return self.model(left_img, right_img)
+        
+        # 使用半精度浮点数以节省显存
+        if self.use_half_precision and left_img.is_cuda:
+            left_img = left_img.half()
+            right_img = right_img.half()
+            self.to(torch.float16)
+        
         # 特征提取
         left_feature = self.feature_extractor(left_img)
         right_feature = self.feature_extractor(right_img)
@@ -114,608 +481,121 @@ class BPNN(nn.Module):
         # 构建代价体
         cost_volume = self.cost_volume_net(left_feature, right_feature)
         
-        # 通过消息传递网络处理代价体
-        # 对每个视差平面单独处理
-        batch_size, _, max_disp, height, width = cost_volume.shape
-        refined_cost = torch.zeros_like(cost_volume)
+        # 分块BP处理以节省显存
+        _, _, _, height, width = cost_volume.shape
         
-        for d in range(max_disp):
-            # 提取当前视差平面的代价
-            data_term = cost_volume[:, :, d, :, :]
-            
-            # 应用消息传递
-            belief = self.message_passing(left_feature, data_term, self.iterations)
-            
-            # 存储优化后的代价
-            refined_cost[:, :, d, :, :] = belief
+        # 将处理分成多个块
+        h_blocks = (height + self.block_size - 1) // self.block_size
+        w_blocks = (width + self.block_size - 1) // self.block_size
         
-        # 从优化后的代价体估计视差
-        disparity = self.estimate_disparity(refined_cost)
+        # 初始化输出视差图
+        disparity = torch.zeros((left_img.shape[0], 1, height, width), device=left_img.device)
         
-        # 视差细化（可选）
+        for h_idx in range(h_blocks):
+            for w_idx in range(w_blocks):
+                # 计算当前块的范围
+                h_start = max(0, h_idx * self.block_size - self.overlap)
+                h_end = min(height, (h_idx + 1) * self.block_size + self.overlap)
+                w_start = max(0, w_idx * self.block_size - self.overlap)
+                w_end = min(width, (w_idx + 1) * self.block_size + self.overlap)
+                
+                # 提取特征块
+                feat_block = left_feature[:, :, h_start:h_end, w_start:w_end]
+                cost_block = cost_volume[:, :, :, h_start:h_end, w_start:w_end]
+                
+                # 信念传播处理
+                disp_block = self._process_block(feat_block, cost_block)
+                
+                # 计算有效区域（去除重叠部分）
+                valid_h_start = 0 if h_idx == 0 else self.overlap
+                valid_h_end = h_end - h_start if h_idx == h_blocks - 1 else min(h_end - h_start, (h_idx + 1) * self.block_size - h_start)
+                valid_w_start = 0 if w_idx == 0 else self.overlap
+                valid_w_end = w_end - w_start if w_idx == w_blocks - 1 else min(w_end - w_start, (w_idx + 1) * self.block_size - w_start)
+                
+                # 填充到输出视差图
+                h_offset = h_idx * self.block_size
+                w_offset = w_idx * self.block_size
+                output_h_start = max(0, h_offset)
+                output_h_end = min(height, h_offset + valid_h_end - valid_h_start)
+                output_w_start = max(0, w_offset)
+                output_w_end = min(width, w_offset + valid_w_end - valid_w_start)
+                
+                disparity[:, :, output_h_start:output_h_end, output_w_start:output_w_end] = \
+                    disp_block[:, :, valid_h_start:valid_h_end, valid_w_start:valid_w_end]
+        
+        # 视差细化（如果需要）
         if self.use_refinement:
-            disparity = self.refinement(left_img, disparity)
+            # 将原始图像与视差连接起来
+            refined_input = torch.cat([left_img, disparity], dim=1)
+            residual = self.refinement(refined_input)
+            disparity = disparity + residual
         
-        # 返回视差图和中间结果
-        results = {
-            'disparity': disparity,              # 最终视差图
-            'left_feature': left_feature,        # 左图像特征
-            'right_feature': right_feature,      # 右图像特征
-            'cost_volume': cost_volume,          # 原始代价体
-            'refined_cost': refined_cost         # 优化后的代价体
-        }
+        # 恢复为单精度（如有必要）
+        if self.use_half_precision and disparity.is_cuda:
+            disparity = disparity.float()
+            self.to(torch.float32)
         
-        return results
-
-
-class DeepBPNetModule(nn.Module):
-    """
-    深度BP网络模块
-
-    一个端到端可训练的模块，结合了深度神经网络和BP算法。
-    此模块是BP层的可微分实现，用于优化视差估计。
-    """
+        return {'disparity': disparity}
     
-    def __init__(self, channels=32, iterations=5):
-        """
-        初始化DeepBPNetModule
+    def _process_block(self, feature_block, cost_block):
+        """处理一个块的BP"""
+        batch_size, _, max_disp, height, width = cost_block.shape
         
-        参数:
-            channels (int): 通道数
-            iterations (int): BP迭代次数
-        """
-        super(DeepBPNetModule, self).__init__()
-        self.iterations = iterations
+        # 初始化视差图
+        disparity = torch.zeros((batch_size, 1, height, width), device=feature_block.device)
         
-        # 数据项网络：学习数据项权重
-        self.data_weight_net = nn.Sequential(
-            nn.Conv2d(channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # 平滑项网络：学习平滑项权重
-        self.smooth_weight_net = nn.Sequential(
-            nn.Conv2d(channels*2, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        
-        # 消息更新网络：学习消息的更新规则
-        self.msg_update_net = nn.Sequential(
-            nn.Conv2d(channels + 1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1)
-        )
-        
-        # 信念更新网络：学习信念的更新规则
-        self.belief_update_net = nn.Sequential(
-            nn.Conv2d(4 + 1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1)
-        )
-    
-    def compute_data_weight(self, feature):
-        """
-        计算数据项权重
-        
-        参数:
-            feature (torch.Tensor): 特征图，形状为 [B, C, H, W]
-            
-        返回:
-            torch.Tensor: 数据项权重，形状为 [B, 1, H, W]
-        """
-        return self.data_weight_net(feature)
-    
-    def compute_smooth_weight(self, feature1, feature2):
-        """
-        计算平滑项权重
-        
-        参数:
-            feature1 (torch.Tensor): 第一个像素特征，形状为 [B, C, H, W]
-            feature2 (torch.Tensor): 第二个像素特征，形状为 [B, C, H, W]
-            
-        返回:
-            torch.Tensor: 平滑项权重，形状为 [B, 1, H, W]
-        """
-        concat_feat = torch.cat([feature1, feature2], dim=1)
-        return self.smooth_weight_net(concat_feat)
-    
-    def message_update(self, feature, cost, msg1, msg2):
-        """
-        更新消息
-        
-        参数:
-            feature (torch.Tensor): 特征图，形状为 [B, C, H, W]
-            cost (torch.Tensor): 数据项代价，形状为 [B, 1, H, W]
-            msg1 (torch.Tensor): 第一个传入消息，形状为 [B, 1, H, W]
-            msg2 (torch.Tensor): 第二个传入消息，形状为 [B, 1, H, W]
-            
-        返回:
-            torch.Tensor: 更新后的消息，形状为 [B, 1, H, W]
-        """
-        # 组合特征和代价
-        input_tensor = torch.cat([feature, cost + msg1 + msg2], dim=1)
-        
-        # 使用网络预测更新后的消息
-        updated_msg = self.msg_update_net(input_tensor)
-        
-        return updated_msg
-    
-    def belief_update(self, cost, msg_up, msg_down, msg_left, msg_right):
-        """
-        更新信念
-        
-        参数:
-            cost (torch.Tensor): 数据项代价，形状为 [B, 1, H, W]
-            msg_up, msg_down, msg_left, msg_right: 各方向的消息
-            
-        返回:
-            torch.Tensor: 更新后的信念，形状为 [B, 1, H, W]
-        """
-        # 组合所有消息和代价
-        input_tensor = torch.cat([msg_up, msg_down, msg_left, msg_right, cost], dim=1)
-        
-        # 使用网络预测更新后的信念
-        updated_belief = self.belief_update_net(input_tensor)
-        
-        return updated_belief
-    
-    def forward(self, feature, cost_volume):
-        """
-        前向传播
-        
-        参数:
-            feature (torch.Tensor): 特征图，形状为 [B, C, H, W]
-            cost_volume (torch.Tensor): 代价体，形状为 [B, 1, D, H, W]
-            
-        返回:
-            torch.Tensor: 优化后的代价体，形状为 [B, 1, D, H, W]
-        """
-        batch_size, _, max_disp, height, width = cost_volume.shape
-        device = feature.device
-        
-        # 计算数据项权重
-        data_weight = self.compute_data_weight(feature)
-        
-        # 初始化优化后的代价体
-        refined_cost = torch.zeros_like(cost_volume)
-        
-        # 对每个视差平面单独处理
+        # 对每个视差平面进行BP处理
         for d in range(max_disp):
             # 提取当前视差平面的代价
-            cost = cost_volume[:, :, d, :, :] * data_weight
+            cost = cost_block[:, :, d]
             
-            # 初始化消息
-            msg_up = torch.zeros((batch_size, 1, height, width), device=device)
-            msg_down = torch.zeros((batch_size, 1, height, width), device=device)
-            msg_left = torch.zeros((batch_size, 1, height, width), device=device)
-            msg_right = torch.zeros((batch_size, 1, height, width), device=device)
+            # 简化的信念传播
+            belief = self._belief_propagation_simple(feature_block, cost)
             
-            # 迭代BP
-            for _ in range(self.iterations):
-                # 更新消息（可以并行处理）
-                # 更新从下到上的消息
-                msg_up_new = torch.zeros_like(msg_up)
-                for i in range(1, height):
-                    i_feature = feature[:, :, i, :]
-                    i_cost = cost[:, :, i, :]
-                    smooth_weight = self.compute_smooth_weight(
-                        feature[:, :, i, :], feature[:, :, i-1, :]
-                    )
-                    msg_up_new[:, :, i-1, :] = self.message_update(
-                        i_feature, i_cost, msg_left[:, :, i, :], msg_right[:, :, i, :]
-                    ) * smooth_weight
-                
-                # 更新从上到下的消息
-                msg_down_new = torch.zeros_like(msg_down)
-                for i in range(height-2, -1, -1):
-                    i_feature = feature[:, :, i, :]
-                    i_cost = cost[:, :, i, :]
-                    smooth_weight = self.compute_smooth_weight(
-                        feature[:, :, i, :], feature[:, :, i+1, :]
-                    )
-                    msg_down_new[:, :, i+1, :] = self.message_update(
-                        i_feature, i_cost, msg_left[:, :, i, :], msg_right[:, :, i, :]
-                    ) * smooth_weight
-                
-                # 更新从右到左的消息
-                msg_left_new = torch.zeros_like(msg_left)
-                for j in range(1, width):
-                    j_feature = feature[:, :, :, j]
-                    j_cost = cost[:, :, :, j]
-                    smooth_weight = self.compute_smooth_weight(
-                        feature[:, :, :, j], feature[:, :, :, j-1]
-                    )
-                    msg_left_new[:, :, :, j-1] = self.message_update(
-                        j_feature, j_cost, msg_up[:, :, :, j], msg_down[:, :, :, j]
-                    ) * smooth_weight
-                
-                # 更新从左到右的消息
-                msg_right_new = torch.zeros_like(msg_right)
-                for j in range(width-2, -1, -1):
-                    j_feature = feature[:, :, :, j]
-                    j_cost = cost[:, :, :, j]
-                    smooth_weight = self.compute_smooth_weight(
-                        feature[:, :, :, j], feature[:, :, :, j+1]
-                    )
-                    msg_right_new[:, :, :, j+1] = self.message_update(
-                        j_feature, j_cost, msg_up[:, :, :, j], msg_down[:, :, :, j]
-                    ) * smooth_weight
-                
-                # 更新消息
-                msg_up = msg_up_new
-                msg_down = msg_down_new
-                msg_left = msg_left_new
-                msg_right = msg_right_new
-            
-            # 更新信念
-            belief = self.belief_update(cost, msg_up, msg_down, msg_left, msg_right)
-            
-            # 存储更新后的代价
-            refined_cost[:, :, d, :, :] = belief
-        
-        return refined_cost
-
-
-class HierarchicalBPNN(nn.Module):
-    """
-    层次化信念传播神经网络
-
-    使用多尺度方法来加速BP的收敛并提高准确性。
-    """
-    
-    def __init__(self, max_disp=64, feature_channels=32, num_scales=3, scale_factor=0.5):
-        """
-        初始化层次化BPNN模型
-        
-        参数:
-            max_disp (int): 最大视差值
-            feature_channels (int): 特征通道数
-            num_scales (int): 尺度级别数量
-            scale_factor (float): 相邻尺度之间的缩放因子
-        """
-        super(HierarchicalBPNN, self).__init__()
-        self.max_disp = max_disp
-        self.num_scales = num_scales
-        self.scale_factor = scale_factor
-        
-        # 特征提取网络
-        self.feature_net = FeatureExtractorNetwork(
-            in_channels=3, 
-            base_channels=feature_channels
-        )
-        
-        # 代价体网络
-        self.cost_net = CostVolumeNetwork(
-            in_channels=feature_channels, 
-            max_disp=max_disp
-        )
-        
-        # 多个尺度的BP模块
-        self.bp_modules = nn.ModuleList([
-            DeepBPNetModule(channels=feature_channels, iterations=5)
-            for _ in range(num_scales)
-        ])
-        
-        # 视差细化网络
-        self.refinement = DisparityRefinementNetwork(in_channels=4)
-    
-    def downsample(self, x, scale):
-        """
-        下采样张量
-        
-        参数:
-            x (torch.Tensor): 输入张量
-            scale (float): 缩放因子
-            
-        返回:
-            torch.Tensor: 下采样后的张量
-        """
-        if scale == 1.0:
-            return x
-        
-        # 根据x的维度确定处理方式
-        if len(x.shape) == 5:  # [B, C, D, H, W]
-            b, c, d, h, w = x.shape
-            x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(b*d, c, h, w)
-            x_down = F.interpolate(
-                x_reshaped, scale_factor=scale, mode='bilinear', align_corners=False
-            )
-            _, _, new_h, new_w = x_down.shape
-            x_down = x_down.reshape(b, d, c, new_h, new_w).permute(0, 2, 1, 3, 4)
-            return x_down
-        else:  # [B, C, H, W]
-            return F.interpolate(
-                x, scale_factor=scale, mode='bilinear', align_corners=False
-            )
-    
-    def upsample(self, x, target_size):
-        """
-        上采样张量到目标尺寸
-        
-        参数:
-            x (torch.Tensor): 输入张量
-            target_size (tuple): 目标尺寸 (H, W)
-            
-        返回:
-            torch.Tensor: 上采样后的张量
-        """
-        # 根据x的维度确定处理方式
-        if len(x.shape) == 5:  # [B, C, D, H, W]
-            b, c, d, _, _ = x.shape
-            x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(b*d, c, x.shape[3], x.shape[4])
-            x_up = F.interpolate(
-                x_reshaped, size=target_size, mode='bilinear', align_corners=False
-            )
-            x_up = x_up.reshape(b, d, c, target_size[0], target_size[1]).permute(0, 2, 1, 3, 4)
-            return x_up
-        else:  # [B, C, H, W]
-            return F.interpolate(
-                x, size=target_size, mode='bilinear', align_corners=False
-            )
-    
-    def forward(self, left_img, right_img):
-        """
-        前向传播
-        
-        参数:
-            left_img (torch.Tensor): 左图像，形状为 [B, C, H, W]
-            right_img (torch.Tensor): 右图像，形状为 [B, C, H, W]
-            
-        返回:
-            dict: 包含视差估计和中间结果的字典
-        """
-        original_size = (left_img.shape[2], left_img.shape[3])
-        
-        # 创建图像和特征的金字塔
-        left_pyramid = [left_img]
-        right_pyramid = [right_img]
-        
-        # 下采样创建图像金字塔
-        for s in range(1, self.num_scales):
-            scale = self.scale_factor ** s
-            left_pyramid.append(self.downsample(left_img, scale))
-            right_pyramid.append(self.downsample(right_img, scale))
-        
-        # 提取每个尺度的特征
-        left_feature_pyramid = []
-        right_feature_pyramid = []
-        
-        for s in range(self.num_scales):
-            left_feature = self.feature_net(left_pyramid[s])
-            right_feature = self.feature_net(right_pyramid[s])
-            left_feature_pyramid.append(left_feature)
-            right_feature_pyramid.append(right_feature)
-        
-        # 从最粗糙的尺度开始处理
-        cost = None
-        
-        for s in range(self.num_scales-1, -1, -1):
-            current_size = (left_pyramid[s].shape[2], left_pyramid[s].shape[3])
-            left_feature = left_feature_pyramid[s]
-            right_feature = right_feature_pyramid[s]
-            
-            # 计算当前尺度的代价体
-            current_cost = self.cost_net(left_feature, right_feature)
-            
-            # 如果有来自粗糙尺度的代价，则上采样并融合
-            if cost is not None:
-                cost = self.upsample(cost, current_size)
-                # 融合粗糙尺度的代价和当前尺度的代价
-                current_cost = current_cost + cost
-            
-            # 应用当前尺度的BP模块
-            cost = self.bp_modules[s](left_feature, current_cost)
-        
-        # 从优化后的代价体估计视差
-        disparity = self.estimate_disparity(cost)
-        
-        # 视差细化
-        disparity = self.refinement(left_img, disparity)
-        
-        return {
-            'disparity': disparity,
-            'cost_volume': cost
-        }
-    
-    def estimate_disparity(self, cost_volume):
-        """
-        从代价体估计视差图
-        
-        参数:
-            cost_volume (torch.Tensor): 代价体，形状为 [B, 1, D, H, W]
-            
-        返回:
-            torch.Tensor: 视差图，形状为 [B, 1, H, W]
-        """
-        # 对D维度求softmax，使其成为概率分布
-        prob_volume = F.softmax(-cost_volume, dim=2)
-        
-        # 创建视差索引，形状为 [D]
-        disp_indices = torch.arange(
-            0, self.max_disp, device=cost_volume.device, dtype=torch.float32
-        )
-        
-        # 扩展视差索引的形状为 [B, 1, D, H, W]
-        disp_indices = disp_indices.view(1, 1, self.max_disp, 1, 1).expand_as(prob_volume)
-        
-        # 计算期望视差（加权和）
-        disparity = torch.sum(disp_indices * prob_volume, dim=2, keepdim=False)
+            # 更新视差图（根据最小代价）
+            disparity = torch.where(belief < disparity, torch.full_like(disparity, d), disparity)
         
         return disparity
-
-
-class DualBPNN(nn.Module):
-    """
-    双通道BPNN模型
     
-    该模型在左右图像上同时应用BP，并通过一致性检查改进结果。
-    """
-    
-    def __init__(self, max_disp=64, feature_channels=32, iterations=5):
-        """
-        初始化双通道BPNN模型
+    def _belief_propagation_simple(self, feature, cost):
+        """简化的BP过程"""
+        batch_size, _, height, width = feature.shape
         
-        参数:
-            max_disp (int): 最大视差值
-            feature_channels (int): 特征通道数
-            iterations (int): BP迭代次数
-        """
-        super(DualBPNN, self).__init__()
-        self.max_disp = max_disp
+        # 初始化消息为零
+        msg_up = torch.zeros_like(cost)
+        msg_down = torch.zeros_like(cost)
+        msg_left = torch.zeros_like(cost)
+        msg_right = torch.zeros_like(cost)
         
-        # 共享的特征提取网络
-        self.feature_net = FeatureExtractorNetwork(
-            in_channels=3, 
-            base_channels=feature_channels
-        )
-        
-        # 左右代价体网络
-        self.left_cost_net = CostVolumeNetwork(
-            in_channels=feature_channels, 
-            max_disp=max_disp
-        )
-        self.right_cost_net = CostVolumeNetwork(
-            in_channels=feature_channels, 
-            max_disp=max_disp
-        )
-        
-        # 左右BP模块
-        self.left_bp_module = DeepBPNetModule(
-            channels=feature_channels, 
-            iterations=iterations
-        )
-        self.right_bp_module = DeepBPNetModule(
-            channels=feature_channels, 
-            iterations=iterations
-        )
-        
-        # 视差融合网络
-        self.fusion_net = nn.Sequential(
-            nn.Conv2d(2, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, kernel_size=3, padding=1)
-        )
-        
-        # 视差细化网络
-        self.refinement = DisparityRefinementNetwork(in_channels=4)
-    
-    def left_right_consistency_check(self, left_disp, right_disp):
-        """
-        左右一致性检查
-        
-        参数:
-            left_disp (torch.Tensor): 左视差图，形状为 [B, 1, H, W]
-            right_disp (torch.Tensor): 右视差图，形状为 [B, 1, H, W]
+        # 迭代BP（减少迭代次数）
+        for _ in range(self.iterations):
+            # 更新所有消息（简化版本）
+            # 更新上方消息
+            for i in range(1, height):
+                msg_input = torch.cat([feature[:, :, i-1:i, :], 
+                                     cost[:, :, i:i+1, :] + msg_down[:, :, i-1:i, :]], dim=1)
+                msg_up[:, :, i-1:i, :] = self.msg_pass(msg_input)
             
-        返回:
-            torch.Tensor: 一致性掩码，形状为 [B, 1, H, W]，值为0或1
-        """
-        batch_size, _, height, width = left_disp.shape
-        device = left_disp.device
-        
-        # 对于左图中的每个像素，在右图中找到对应点
-        x_left = torch.arange(0, width, device=device).view(1, 1, 1, width).expand(batch_size, 1, height, width)
-        y_left = torch.arange(0, height, device=device).view(1, 1, height, 1).expand(batch_size, 1, height, width)
-        
-        # 计算对应右图中的x坐标
-        x_right = x_left - left_disp
-        x_right = torch.clamp(x_right, 0, width-1)
-        
-        # 对右视差图进行采样
-        x_right_int = x_right.long().squeeze(1)
-        y_left_int = y_left.long().squeeze(1)
-        
-        right_disp_at_left = torch.zeros_like(left_disp)
-        for b in range(batch_size):
-            for h in range(height):
-                for w in range(width):
-                    xr = x_right_int[b, h, w]
-                    if 0 <= xr < width:
-                        right_disp_at_left[b, 0, h, w] = right_disp[b, 0, h, xr]
-        
-        # 计算左右视差的差异
-        diff = torch.abs(left_disp + right_disp_at_left)
-        
-        # 一致性掩码：差异小于阈值的像素
-        consistency_mask = (diff < 1.0).float()
-        
-        return consistency_mask
-    
-    def forward(self, left_img, right_img):
-        """
-        前向传播
-        
-        参数:
-            left_img (torch.Tensor): 左图像，形状为 [B, C, H, W]
-            right_img (torch.Tensor): 右图像，形状为 [B, C, H, W]
+            # 更新下方消息
+            for i in range(height - 2, -1, -1):
+                msg_input = torch.cat([feature[:, :, i+1:i+2, :], 
+                                     cost[:, :, i:i+1, :] + msg_up[:, :, i+1:i+2, :]], dim=1)
+                msg_down[:, :, i+1:i+2, :] = self.msg_pass(msg_input)
             
-        返回:
-            dict: 包含视差估计和中间结果的字典
-        """
-        # 提取特征
-        left_feature = self.feature_net(left_img)
-        right_feature = self.feature_net(right_img)
-        
-        # 计算左右代价体
-        left_cost = self.left_cost_net(left_feature, right_feature)
-        right_cost = self.right_cost_net(right_feature, left_feature)
-        
-        # 应用BP模块
-        left_refined_cost = self.left_bp_module(left_feature, left_cost)
-        right_refined_cost = self.right_bp_module(right_feature, right_cost)
-        
-        # 估计左右视差
-        left_disp = self.estimate_disparity(left_refined_cost)
-        right_disp = self.estimate_disparity(right_refined_cost)
-        
-        # 左右一致性检查
-        consistency_mask = self.left_right_consistency_check(left_disp, right_disp)
-        
-        # 融合左右视差
-        fused_disp = self.fusion_net(torch.cat([left_disp, right_disp], dim=1))
-        
-        # 使用一致性掩码过滤结果
-        # 对于一致性检查不通过的像素，可以使用更复杂的后处理
-        fused_disp = fused_disp * consistency_mask + left_disp * (1 - consistency_mask)
-        
-        # 视差细化
-        refined_disp = self.refinement(left_img, fused_disp)
-        
-        return {
-            'disparity': refined_disp,
-            'left_disparity': left_disp,
-            'right_disparity': right_disp,
-            'consistency_mask': consistency_mask
-        }
-    
-    def estimate_disparity(self, cost_volume):
-        """
-        从代价体估计视差图
-        
-        参数:
-            cost_volume (torch.Tensor): 代价体，形状为 [B, 1, D, H, W]
+            # 更新左侧消息
+            for j in range(1, width):
+                msg_input = torch.cat([feature[:, :, :, j-1:j], 
+                                     cost[:, :, :, j:j+1] + msg_right[:, :, :, j-1:j]], dim=1)
+                msg_left[:, :, :, j-1:j] = self.msg_pass(msg_input)
             
-        返回:
-            torch.Tensor: 视差图，形状为 [B, 1, H, W]
-        """
-        # 对D维度求softmax，使其成为概率分布
-        prob_volume = F.softmax(-cost_volume, dim=2)
+            # 更新右侧消息
+            for j in range(width - 2, -1, -1):
+                msg_input = torch.cat([feature[:, :, :, j+1:j+2], 
+                                     cost[:, :, :, j:j+1] + msg_left[:, :, :, j+1:j+2]], dim=1)
+                msg_right[:, :, :, j+1:j+2] = self.msg_pass(msg_input)
         
-        # 创建视差索引，形状为 [D]
-        disp_indices = torch.arange(
-            0, self.max_disp, device=cost_volume.device, dtype=torch.float32
-        )
+        # 计算最终信念
+        belief_input = torch.cat([cost, msg_up, msg_down, msg_left, msg_right], dim=1)
+        belief = self.belief_update(belief_input)
         
-        # 扩展视差索引的形状为 [B, 1, D, H, W]
-        disp_indices = disp_indices.view(1, 1, self.max_disp, 1, 1).expand_as(prob_volume)
-        
-        # 计算期望视差（加权和）
-        disparity = torch.sum(disp_indices * prob_volume, dim=2, keepdim=False)
-        
-        return disparity
+        return belief

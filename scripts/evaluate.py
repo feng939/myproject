@@ -12,16 +12,15 @@ import yaml
 import torch
 import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 import cv2
 
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.bpnn import BPNN, HierarchicalBPNN, DualBPNN
+from src.models.bpnn import BPNN
 from src.data.dataset import get_data_loaders
 from src.utils.metrics import compute_error_metrics
-from src.utils.visualization import colorize_disparity, save_disparity_image
+from src.utils.visualization import colorize_disparity
 
 
 def parse_args():
@@ -52,47 +51,34 @@ def load_config(config_path):
     return config
 
 
-def create_model(config):
-    """创建模型"""
+def load_model(model_path, config, device):
+    """加载模型"""
+    # 创建模型
     model_config = config['model']
-    model_type = model_config.get('type', 'bpnn').lower()
+    model = BPNN(
+        max_disp=model_config.get('max_disp', 32),
+        feature_channels=model_config.get('feature_channels', 16),
+        iterations=model_config.get('iterations', 3),
+        use_attention=model_config.get('use_attention', True),
+        use_refinement=model_config.get('use_refinement', True),
+        use_half_precision=model_config.get('use_half_precision', True),
+        block_size=model_config.get('block_size', 64),
+        overlap=model_config.get('overlap', 8)
+    )
     
-    if model_type == 'hierarchical':
-        model = HierarchicalBPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            num_scales=model_config.get('num_scales', 3),
-            scale_factor=model_config.get('scale_factor', 0.5)
-        )
-    elif model_type == 'dual':
-        model = DualBPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            iterations=model_config.get('iterations', 5)
-        )
-    else:  # 默认BPNN
-        model = BPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            iterations=model_config.get('iterations', 5),
-            use_attention=model_config.get('use_attention', False),
-            use_refinement=model_config.get('use_refinement', True)
-        )
-    
-    return model
-
-
-def load_model(model, model_path, device):
-    """加载模型权重"""
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"模型文件不存在: {model_path}")
-    
+    # 加载权重
     checkpoint = torch.load(model_path, map_location=device)
-    
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model.load_state_dict(checkpoint)
+    
+    # 将模型移动到设备
+    model = model.to(device)
+    
+    # 如果启用半精度，立即转换模型
+    if model_config.get('use_half_precision', True) and device.type == 'cuda':
+        model = model.half()
     
     model.eval()
     return model
@@ -107,10 +93,7 @@ def evaluate(model, test_loader, device, save_dir=None, visualize=False):
         'epe': 0.0,
         'bad1': 0.0,
         'bad3': 0.0,
-        'bad5': 0.0,
-        'delta1': 0.0,
-        'delta2': 0.0,
-        'delta3': 0.0
+        'bad5': 0.0
     }
     
     # 创建保存目录（如果需要）
@@ -122,7 +105,7 @@ def evaluate(model, test_loader, device, save_dir=None, visualize=False):
     
     # 遍历测试集
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_loader, desc="评估中")):
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc="评估中")):
             # 准备数据
             left_img = batch['left'].to(device)
             right_img = batch['right'].to(device)
@@ -181,9 +164,6 @@ def print_metrics(metrics):
     print(f"错误像素比率 >1px: {metrics['bad1']:.4f}")
     print(f"错误像素比率 >3px: {metrics['bad3']:.4f}")
     print(f"错误像素比率 >5px: {metrics['bad5']:.4f}")
-    print(f"深度准确率 δ<1.25: {metrics['delta1']:.4f}")
-    print(f"深度准确率 δ<1.25²: {metrics['delta2']:.4f}")
-    print(f"深度准确率 δ<1.25³: {metrics['delta3']:.4f}")
 
 
 def save_metrics(metrics, save_dir):
@@ -196,9 +176,6 @@ def save_metrics(metrics, save_dir):
         f.write(f"错误像素比率 >1px: {metrics['bad1']:.4f}\n")
         f.write(f"错误像素比率 >3px: {metrics['bad3']:.4f}\n")
         f.write(f"错误像素比率 >5px: {metrics['bad5']:.4f}\n")
-        f.write(f"深度准确率 δ<1.25: {metrics['delta1']:.4f}\n")
-        f.write(f"深度准确率 δ<1.25²: {metrics['delta2']:.4f}\n")
-        f.write(f"深度准确率 δ<1.25³: {metrics['delta3']:.4f}\n")
     
     print(f"指标已保存到 {metrics_path}")
 
@@ -217,12 +194,8 @@ def main():
         device = torch.device('cpu')
     print(f"使用设备: {device}")
     
-    # 创建模型
-    model = create_model(config)
-    print(f"模型类型: {config['model'].get('type', 'bpnn')}")
-    
-    # 加载模型权重
-    model = load_model(model, args.model_path, device)
+    # 加载模型
+    model = load_model(args.model_path, config, device)
     print(f"模型已加载: {args.model_path}")
     
     # 加载数据

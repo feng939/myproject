@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.bpnn import BPNN, HierarchicalBPNN, DualBPNN
+from src.models.bpnn import BPNN
 from src.inference.predict import DisparityPredictor
 from src.utils.visualization import (
     colorize_disparity, 
@@ -38,10 +38,7 @@ def parse_args():
                        help='真值视差图路径（可选）')
     parser.add_argument('--model_path', type=str, default=None,
                        help='模型路径（可选）')
-    parser.add_argument('--model_type', type=str, default='bpnn',
-                       choices=['bpnn', 'hierarchical', 'dual'],
-                       help='模型类型')
-    parser.add_argument('--max_disp', type=int, default=64,
+    parser.add_argument('--max_disp', type=int, default=32,
                        help='最大视差值')
     parser.add_argument('--output', type=str, default='demo_output.png',
                        help='输出图像路径')
@@ -49,35 +46,24 @@ def parse_args():
                        help='保存视差图的路径')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU ID，-1表示使用CPU')
+    parser.add_argument('--use_attention', action='store_true',
+                        help='使用注意力机制')
     parser.add_argument('--target_size', type=str, default=None,
-                       help='目标大小，格式为HxW，例如：384x1280')
+                       help='目标大小，格式为HxW，例如：200x200')
     
     return parser.parse_args()
 
 
-def create_model(model_type, max_disp):
+def create_model(max_disp, use_attention):
     """创建模型"""
-    if model_type == 'hierarchical':
-        model = HierarchicalBPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            num_scales=3,
-            scale_factor=0.5
-        )
-    elif model_type == 'dual':
-        model = DualBPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            iterations=5
-        )
-    else:  # 默认BPNN
-        model = BPNN(
-            max_disp=max_disp,
-            feature_channels=32,
-            iterations=5,
-            use_attention=False,
-            use_refinement=True
-        )
+    model = BPNN(
+        max_disp=max_disp,
+        feature_channels=16,
+        iterations=3,
+        use_attention=use_attention,
+        use_refinement=True,
+        use_half_precision=True
+    )
     
     return model
 
@@ -112,48 +98,18 @@ def load_disparity(disp_path):
     if not os.path.exists(disp_path):
         raise FileNotFoundError(f"视差图文件不存在: {disp_path}")
     
-    # 根据文件扩展名选择加载方式
-    if disp_path.endswith('.pfm'):
-        # 读取PFM格式
-        with open(disp_path, 'rb') as f:
-            header = f.readline().decode('UTF-8').rstrip()
-            if header == 'PF':
-                channels = 3
-            elif header == 'Pf':
-                channels = 1
-            else:
-                raise Exception('不是PFM文件')
-            
-            dim_match = f.readline().decode('UTF-8')
-            width, height = map(int, dim_match.split())
-            
-            scale = float(f.readline().decode('UTF-8').rstrip())
-            little_endian = scale < 0
-            scale = abs(scale)
-            
-            data = np.fromfile(f, np.float32)
-            data = data.reshape(height, width, channels) if channels > 1 else data.reshape(height, width)
-            
-            if little_endian:
-                data = data.byteswap()
-            
-            return data
-    elif disp_path.endswith('.npy'):
-        # 读取NumPy数组
-        return np.load(disp_path)
+    # 默认读取图像
+    disp = cv2.imread(disp_path, cv2.IMREAD_UNCHANGED)
+    
+    # 处理不同格式的视差图
+    if disp.dtype == np.uint16:
+        # 16位图像，通常需要缩放
+        return disp.astype(np.float32) / 256.0
+    elif disp.dtype == np.uint8:
+        # 8位图像，通常需要缩放
+        return disp.astype(np.float32)
     else:
-        # 默认读取图像
-        disp = cv2.imread(disp_path, cv2.IMREAD_UNCHANGED)
-        
-        # 处理不同格式的视差图
-        if disp.dtype == np.uint16:
-            # 16位图像，通常需要缩放
-            return disp.astype(np.float32) / 256.0
-        elif disp.dtype == np.uint8:
-            # 8位图像，通常需要缩放
-            return disp.astype(np.float32)
-        else:
-            return disp
+        return disp
 
 
 def parse_target_size(target_size_str):
@@ -179,8 +135,9 @@ def main():
     target_size = parse_target_size(args.target_size)
     
     # 创建模型
-    model = create_model(args.model_type, args.max_disp)
-    print(f"模型类型: {args.model_type}")
+    model = create_model(args.max_disp, args.use_attention)
+    print(f"最大视差: {args.max_disp}")
+    print(f"使用注意力: {args.use_attention}")
     
     # 加载模型权重
     model = load_model(model, args.model_path, device)
@@ -228,30 +185,10 @@ def main():
         # 确保输出目录存在
         os.makedirs(os.path.dirname(os.path.abspath(args.save_disparity)), exist_ok=True)
         
-        # 保存视差图
-        if args.save_disparity.endswith('.pfm'):
-            # 保存为PFM格式
-            with open(args.save_disparity, 'wb') as f:
-                # 写入头部信息
-                f.write(b'Pf\n')
-                f.write(f"{disparity.shape[1]} {disparity.shape[0]}\n".encode())
-                
-                # 确定字节序
-                scale = -1.0  # 小端
-                f.write(f"{scale}\n".encode())
-                
-                # 写入数据（按行倒序）
-                data = disparity.astype(np.float32)
-                data = np.flipud(data)
-                data.tofile(f)
-        elif args.save_disparity.endswith('.npy'):
-            # 保存为NumPy数组
-            np.save(args.save_disparity, disparity)
-        else:
-            # 保存为PNG
-            # 生成彩色视差图
-            color_disparity = colorize_disparity(disparity)
-            cv2.imwrite(args.save_disparity, cv2.cvtColor(color_disparity, cv2.COLOR_RGB2BGR))
+        # 保存为PNG
+        # 生成彩色视差图
+        color_disparity = colorize_disparity(disparity)
+        cv2.imwrite(args.save_disparity, cv2.cvtColor(color_disparity, cv2.COLOR_RGB2BGR))
         
         print(f"视差图已保存到: {args.save_disparity}")
     

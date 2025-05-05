@@ -96,12 +96,20 @@
                     </div>
                     <div class="card-body">
                         <div class="mb-3">
-                            <label for="modelType" class="form-label">模型类型</label>
-                            <select class="form-select" id="modelType">
-                                <option value="bpnn" selected>BPNN</option>
-                                <option value="hierarchical">Hierarchical BPNN</option>
-                                <option value="dual">Dual BPNN</option>
-                            </select>
+                            <label for="maxDisp" class="form-label">最大视差</label>
+                            <input type="number" class="form-control" id="maxDisp" value="32" min="16" max="64">
+                        </div>
+                        <div class="mb-3">
+                            <label for="iterations" class="form-label">BP迭代次数</label>
+                            <input type="number" class="form-control" id="iterations" value="3" min="1" max="5">
+                        </div>
+                        <div class="mb-3 form-check">
+                            <input type="checkbox" class="form-check-input" id="useAttention" checked>
+                            <label class="form-check-label" for="useAttention">使用注意力机制</label>
+                        </div>
+                        <div class="mb-3 form-check">
+                            <input type="checkbox" class="form-check-input" id="useRefinement" checked>
+                            <label class="form-check-label" for="useRefinement">使用视差细化</label>
                         </div>
                         <div class="mb-3">
                             <label for="modelFile" class="form-label">模型文件</label>
@@ -109,18 +117,6 @@
                                 <option value="" selected>默认模型</option>
                                 <!-- 将从服务器加载可用模型 -->
                             </select>
-                        </div>
-                        <div class="mb-3">
-                            <label for="maxDisp" class="form-label">最大视差</label>
-                            <input type="number" class="form-control" id="maxDisp" value="64" min="16" max="192">
-                        </div>
-                        <div class="mb-3">
-                            <label for="iterations" class="form-label">BP迭代次数</label>
-                            <input type="number" class="form-control" id="iterations" value="5" min="1" max="20">
-                        </div>
-                        <div class="mb-3 form-check">
-                            <input type="checkbox" class="form-check-input" id="useRefinement" checked>
-                            <label class="form-check-label" for="useRefinement">使用视差细化</label>
                         </div>
                         <button id="loadModelBtn" class="btn btn-primary w-100">加载模型</button>
                     </div>
@@ -360,7 +356,7 @@
         function loadModel() {
             var modelConfig = {
                 model_path: $('#modelFile').val(),
-                model_type: $('#modelType').val(),
+                use_attention: $('#useAttention').prop('checked'),
                 max_disp: $('#maxDisp').val(),
                 iterations: $('#iterations').val(),
                 use_refinement: $('#useRefinement').prop('checked')

@@ -57,7 +57,7 @@ class Trainer:
         # 优化器
         optim_config = config.get('optimizer', {})
         optim_type = optim_config.get('type', 'adam').lower()
-        lr = optim_config.get('lr', 0.001)
+        lr = optim_config.get('lr', 0.0005)
         weight_decay = optim_config.get('weight_decay', 0.0001)
         
         if optim_type == 'adam':
@@ -74,13 +74,6 @@ class Trainer:
                 momentum=optim_config.get('momentum', 0.9),
                 weight_decay=weight_decay
             )
-        elif optim_type == 'rmsprop':
-            self.optimizer = optim.RMSprop(
-                model.parameters(), 
-                lr=lr, 
-                weight_decay=weight_decay,
-                momentum=optim_config.get('momentum', 0)
-            )
         else:
             raise ValueError(f"不支持的优化器类型: {optim_type}")
         
@@ -91,7 +84,7 @@ class Trainer:
         if lr_scheduler_type == 'step':
             self.lr_scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer,
-                step_size=lr_scheduler_config.get('step_size', 20),
+                step_size=lr_scheduler_config.get('step_size', 15),
                 gamma=lr_scheduler_config.get('gamma', 0.5)
             )
         elif lr_scheduler_type == 'plateau':
@@ -101,17 +94,11 @@ class Trainer:
                 factor=lr_scheduler_config.get('factor', 0.5),
                 patience=lr_scheduler_config.get('patience', 5)
             )
-        elif lr_scheduler_type == 'cosine':
-            self.lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=lr_scheduler_config.get('T_max', 10),
-                eta_min=lr_scheduler_config.get('eta_min', 0)
-            )
         else:
             self.lr_scheduler = None
         
         # 训练配置
-        self.num_epochs = config.get('num_epochs', 100)
+        self.num_epochs = config.get('num_epochs', 30)
         self.save_dir = config.get('save_dir', 'checkpoints')
         self.log_dir = config.get('log_dir', 'logs')
         self.save_freq = config.get('save_freq', 5)
@@ -256,7 +243,7 @@ class Trainer:
                 pred_disp = outputs
             
             # 计算损失
-            loss = self.criterion(pred_disp, target_disp)
+            loss = self.criterion(pred_disp, target_disp, left_img)
             
             # 反向传播
             loss.backward()
@@ -278,7 +265,8 @@ class Trainer:
                 metrics = compute_error_metrics(pred_disp, target_disp)
             
             for k, v in metrics.items():
-                epoch_metrics[k] += v
+                if k in epoch_metrics:
+                    epoch_metrics[k] += v
             
             # 更新进度条信息
             pbar.set_postfix({
@@ -291,7 +279,8 @@ class Trainer:
                 step = epoch * num_batches + batch_idx
                 self.writer.add_scalar('train/batch_loss', batch_loss, step)
                 for k, v in metrics.items():
-                    self.writer.add_scalar(f'train/batch_{k}', v, step)
+                    if k in epoch_metrics:
+                        self.writer.add_scalar(f'train/batch_{k}', v, step)
         
         # 计算平均损失和指标
         epoch_loss /= num_batches
@@ -350,7 +339,7 @@ class Trainer:
                     pred_disp = outputs
                 
                 # 计算损失
-                loss = self.criterion(pred_disp, target_disp)
+                loss = self.criterion(pred_disp, target_disp, left_img)
                 
                 # 更新损失
                 batch_loss = loss.item()
@@ -360,7 +349,8 @@ class Trainer:
                 metrics = compute_error_metrics(pred_disp, target_disp)
                 
                 for k, v in metrics.items():
-                    val_metrics[k] += v
+                    if k in val_metrics:
+                        val_metrics[k] += v
                 
                 # 更新进度条信息
                 pbar.set_postfix({

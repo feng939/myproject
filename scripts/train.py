@@ -16,11 +16,10 @@ import random
 # 添加项目根目录到路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.models.bpnn import BPNN, HierarchicalBPNN, DualBPNN
+from src.models.bpnn import BPNN
 from src.data.dataset import get_data_loaders
 from src.training.trainer import Trainer
 
-torch.cuda.empty_cache()
 
 def parse_args():
     """解析命令行参数"""
@@ -61,29 +60,26 @@ def load_config(config_path):
 def create_model(config):
     """创建模型"""
     model_config = config['model']
-    model_type = model_config.get('type', 'bpnn').lower()
     
-    if model_type == 'hierarchical':
-        model = HierarchicalBPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            num_scales=model_config.get('num_scales', 3),
-            scale_factor=model_config.get('scale_factor', 0.5)
-        )
-    elif model_type == 'dual':
-        model = DualBPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            iterations=model_config.get('iterations', 5)
-        )
-    else:  # 默认BPNN
-        model = BPNN(
-            max_disp=model_config.get('max_disp', 192),
-            feature_channels=model_config.get('feature_channels', 32),
-            iterations=model_config.get('iterations', 5),
-            use_attention=model_config.get('use_attention', False),
-            use_refinement=model_config.get('use_refinement', True)
-        )
+    # 创建BPNN模型
+    model = BPNN(
+        max_disp=model_config.get('max_disp', 32),
+        feature_channels=model_config.get('feature_channels', 16),
+        iterations=model_config.get('iterations', 3),
+        use_attention=model_config.get('use_attention', True),
+        use_refinement=model_config.get('use_refinement', True),
+        use_half_precision=model_config.get('use_half_precision', True),
+        block_size=model_config.get('block_size', 64),
+        overlap=model_config.get('overlap', 8)
+    )
+    
+    # 移动到设备
+    device = config['device']
+    model = model.to(device)
+    
+    # 如果启用半精度，立即转换模型
+    if model_config.get('use_half_precision', True) and device.type == 'cuda':
+        model = model.half()
     
     return model
 

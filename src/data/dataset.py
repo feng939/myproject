@@ -29,9 +29,8 @@ class StereoDataset(Dataset):
                  split='train',
                  transform=None, 
                  augment=False,
-                 max_disp=192,
-                 crop_size=None,
-                 resize_size=None):
+                 max_disp=32,
+                 resize=None):
         """
         初始化数据集
         
@@ -41,84 +40,18 @@ class StereoDataset(Dataset):
             transform (callable, optional): 应用于样本的可选变换
             augment (bool): 是否进行数据增强
             max_disp (int): 最大视差值
-            crop_size (tuple): 裁剪尺寸，如 (height, width)
-            resize_size (tuple): 调整后的尺寸，如 (height, width)
+            resize (tuple): 调整后的尺寸，如 (height, width)
         """
         self.root_dir = root_dir
         self.split = split
         self.transform = transform
         self.augment = augment
         self.max_disp = max_disp
-        self.crop_size = crop_size
-        self.resize_size = resize_size
+        self.resize = resize
         
         # 子类需要实现样本列表的生成
         self.samples = []
-        
-    def _resize_with_aspect_ratio(self, img, target_size, is_disparity=False, scale_factor=None):
-        """
-        保持宽高比调整图像或视差图大小，并进行中心填充
     
-        参数:
-            img: numpy.ndarray 类型的图像或视差图
-            target_size: 目标尺寸 (height, width)
-            is_disparity: 是否为视差图
-            scale_factor: 视差值缩放因子，如果为None则自动计算
-        
-        返回:
-            调整大小后的图像或视差图
-        """
-        # 获取原始尺寸
-        if len(img.shape) == 3:  # RGB 图像
-            orig_height, orig_width, _ = img.shape
-        else:  # 视差图
-            orig_height, orig_width = img.shape
-
-        target_height, target_width = target_size
-    
-        # 计算缩放比例
-        width_ratio = target_width / orig_width
-        height_ratio = target_height / orig_height
-        ratio = min(width_ratio, height_ratio)
-        
-        # 计算新的尺寸
-        new_width = int(orig_width * ratio)
-        new_height = int(orig_height * ratio)
-        
-        # 调整图像/视差图大小
-        if is_disparity:
-            # 对视差图使用最近邻插值
-            resized_img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
-            # 调整视差值（视差值需要跟随宽度缩放）
-            if scale_factor is None:
-                scale_factor = ratio  # 默认使用相同的缩放比例
-            resized_img = resized_img * scale_factor
-        else:
-            # 对普通图像使用双线性插值
-            resized_img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-        
-        # 如果调整后的尺寸与目标尺寸不同，进行填充
-        if new_width != target_width or new_height != target_height:
-            # 创建目标大小的图像/视差图
-            if len(img.shape) == 3:  # RGB 图像
-                result_img = np.zeros((target_height, target_width, img.shape[2]), dtype=img.dtype)
-            else:  # 视差图
-                result_img = np.zeros((target_height, target_width), dtype=img.dtype)
-            
-            # 计算粘贴位置（居中）
-            paste_x = max(0, (target_width - new_width) // 2)
-            paste_y = max(0, (target_height - new_height) // 2)
-            
-            # 粘贴调整大小后的图像/视差图
-            if len(img.shape) == 3:  # RGB 图像
-                result_img[paste_y:paste_y+new_height, paste_x:paste_x+new_width, :] = resized_img
-            else:  # 视差图
-                result_img[paste_y:paste_y+new_height, paste_x:paste_x+new_width] = resized_img
-            
-            return result_img
-        else:
-            return resized_img
-
     def __len__(self):
         """返回数据集中样本数量"""
         return len(self.samples)
@@ -147,7 +80,7 @@ class StereoDataset(Dataset):
         # 加载视差图（如果有）
         disparity = None
         if 'disparity' in sample_paths and sample_paths['disparity']:
-            # 根据文件类型加载视差图
+            # 加载视差图
             disp_path = sample_paths['disparity']
             if disp_path.endswith('.pfm'):
                 disparity = self._read_pfm(disp_path)
@@ -156,25 +89,18 @@ class StereoDataset(Dataset):
                 # 一些数据集中PNG格式的视差图需要缩放
                 if disparity.max() > self.max_disp:
                     disparity = disparity / 256.0
-            elif disp_path.endswith('.npy'):
-                disparity = np.load(disp_path)
             else:
                 # 默认处理
                 disparity = np.array(Image.open(disp_path))
         
-        # 裁剪图像（如果指定了crop_size）
-        if self.crop_size is not None:
-            left_img, right_img, disparity = self._random_crop(
-                left_img, right_img, disparity)
-        
-        # 调整图像和视差图大小（如果指定了resize_size）
-        if self.resize_size is not None:
+        # 调整图像和视差图大小（如果指定了resize）
+        if self.resize is not None:
             # 保存原始宽度（用于计算视差值缩放因子）
             orig_width = left_img.shape[1]
             
             # 调整左右图像大小
-            left_img = self._resize_with_aspect_ratio(left_img, self.resize_size)
-            right_img = self._resize_with_aspect_ratio(right_img, self.resize_size)
+            left_img = cv2.resize(left_img, (self.resize[1], self.resize[0]))
+            right_img = cv2.resize(right_img, (self.resize[1], self.resize[0]))
             
             # 调整视差图大小和视差值
             if disparity is not None:
@@ -183,8 +109,10 @@ class StereoDataset(Dataset):
                 disp_scale_factor = new_width / orig_width
                 
                 # 调整视差图
-                disparity = self._resize_with_aspect_ratio(
-                    disparity, self.resize_size, is_disparity=True, scale_factor=disp_scale_factor)
+                disparity = cv2.resize(disparity, (self.resize[1], self.resize[0]), 
+                                     interpolation=cv2.INTER_NEAREST)
+                print(disparity)
+                disparity = disparity * disp_scale_factor
         
         # 数据增强（可选）
         if self.augment and self.split == 'train':
@@ -206,7 +134,7 @@ class StereoDataset(Dataset):
                 disparity = torch.from_numpy(disparity.astype(np.float32))
             else:
                 # 如果没有有效视差值，设为零张量
-                disparity = torch.zeros(left_img.shape[1:3], dtype=torch.float32)
+                disparity = torch.zeros((left_img.shape[1], left_img.shape[2]), dtype=torch.float32)
             
             # 增加通道维度
             disparity = disparity.unsqueeze(0)
@@ -246,40 +174,6 @@ class StereoDataset(Dataset):
         
         return img
     
-    def _random_crop(self, left_img, right_img, disparity=None):
-        """
-        随机裁剪图像对
-        
-        参数:
-            left_img (numpy.ndarray): 左图像
-            right_img (numpy.ndarray): 右图像
-            disparity (numpy.ndarray, optional): 视差图
-            
-        返回:
-            tuple: 裁剪后的图像和视差图
-        """
-        h, w = left_img.shape[:2]
-        crop_h, crop_w = self.crop_size
-        
-        # 确保裁剪尺寸不超过图像尺寸
-        crop_h = min(h, crop_h)
-        crop_w = min(w, crop_w)
-        
-        # 随机选择裁剪位置
-        start_h = random.randint(0, h - crop_h)
-        start_w = random.randint(0, w - crop_w)
-        
-        # 裁剪图像
-        left_img_cropped = left_img[start_h:start_h+crop_h, start_w:start_w+crop_w]
-        right_img_cropped = right_img[start_h:start_h+crop_h, start_w:start_w+crop_w]
-        
-        # 裁剪视差图（如果有）
-        disparity_cropped = None
-        if disparity is not None:
-            disparity_cropped = disparity[start_h:start_h+crop_h, start_w:start_w+crop_w]
-        
-        return left_img_cropped, right_img_cropped, disparity_cropped
-    
     def _read_pfm(self, file_path):
         """
         读取PFM格式的视差图
@@ -292,11 +186,7 @@ class StereoDataset(Dataset):
         """
         with open(file_path, 'rb') as f:
             header = f.readline().decode('UTF-8').rstrip()
-            if header == 'PF':
-                channels = 3
-            elif header == 'Pf':
-                channels = 1
-            else:
+            if header not in ['PF', 'Pf']:
                 raise Exception('Not a PFM file.')
 
             dim_match = f.readline().decode('UTF-8')
@@ -306,12 +196,18 @@ class StereoDataset(Dataset):
             little_endian = scale < 0
             scale = abs(scale)
             
+            channels = 3 if header == 'PF' else 1
+
             data = np.fromfile(f, np.float32)
-            data = data.reshape(height, width, channels) if channels > 1 else data.reshape(height, width)
+            shape = (height, width, channels) if channels > 1 else (height, width)
+            data = np.reshape(data, shape)
+            #data = data.reshape(height, width, channels) if channels > 1 else data.reshape(height, width)
             
             if little_endian:
                 data = data.byteswap()
                 
+            data = np.flipud(data)
+
             return data
 
 
@@ -327,15 +223,14 @@ class MiddleburyDataset(StereoDataset):
                  split='train',
                  transform=None, 
                  augment=False,
-                 max_disp=192,
-                 crop_size=None,
-                 resize_size=None):
+                 max_disp=32,
+                 resize=None):
         """
         初始化Middlebury数据集
         
         参数与StereoDataset基类相同
         """
-        super().__init__(root_dir, split, transform, augment, max_disp, crop_size, resize_size)
+        super().__init__(root_dir, split, transform, augment, max_disp, resize)
         
         # 生成样本列表
         self._generate_samples()
@@ -381,249 +276,6 @@ class MiddleburyDataset(StereoDataset):
             })
 
 
-class KITTIDataset(StereoDataset):
-    """
-    KITTI立体视觉数据集
-    
-    该类加载KITTI数据集，一个自动驾驶场景的立体视觉数据集。
-    """
-    
-    def __init__(self, 
-                 root_dir,
-                 split='train',
-                 transform=None, 
-                 augment=False,
-                 max_disp=192,
-                 crop_size=None):
-        """
-        初始化KITTI数据集
-        
-        参数与StereoDataset基类相同
-        """
-        super().__init__(root_dir, split, transform, augment, max_disp, crop_size)
-        
-        # 生成样本列表
-        self._generate_samples()
-    
-    def _generate_samples(self):
-        """生成KITTI数据集的样本列表"""
-        # 确定图像和视差图的目录
-        if self.split == 'train' or self.split == 'val':
-            img_dir = os.path.join(self.root_dir, 'training', 'image_2')
-            right_img_dir = os.path.join(self.root_dir, 'training', 'image_3')
-            disp_dir = os.path.join(self.root_dir, 'training', 'disp_occ_0')
-        else:  # test
-            img_dir = os.path.join(self.root_dir, 'testing', 'image_2')
-            right_img_dir = os.path.join(self.root_dir, 'testing', 'image_3')
-            disp_dir = None  # 测试集没有真值视差图
-        
-        # 确保目录存在
-        if not os.path.exists(img_dir) or not os.path.exists(right_img_dir):
-            raise ValueError(f"目录不存在: {img_dir} 或 {right_img_dir}")
-        
-        # 查找所有左图像
-        left_imgs = sorted(glob.glob(os.path.join(img_dir, '*.png')))
-        
-        # 对于每个左图像，找到对应的右图像和视差图
-        for left_img_path in left_imgs:
-            # 提取图像ID
-            img_id = os.path.basename(left_img_path)
-            
-            # 右图像
-            right_img_path = os.path.join(right_img_dir, img_id)
-            if not os.path.exists(right_img_path):
-                continue
-            
-            # 视差图（如果存在）
-            disp_path = None
-            if disp_dir is not None:
-                disp_path = os.path.join(disp_dir, img_id)
-                if not os.path.exists(disp_path):
-                    disp_path = None
-            
-            # 添加到样本列表
-            self.samples.append({
-                'left': left_img_path,
-                'right': right_img_path,
-                'disparity': disp_path,
-                'id': img_id
-            })
-
-
-class ETH3DDataset(StereoDataset):
-    """
-    ETH3D立体视觉数据集
-    
-    该类加载ETH3D数据集，一个室内外场景的高分辨率立体视觉数据集。
-    """
-    
-    def __init__(self, 
-                 root_dir,
-                 split='train',
-                 transform=None, 
-                 augment=False,
-                 max_disp=192,
-                 crop_size=None):
-        """
-        初始化ETH3D数据集
-        
-        参数与StereoDataset基类相同
-        """
-        super().__init__(root_dir, split, transform, augment, max_disp, crop_size)
-        
-        # 生成样本列表
-        self._generate_samples()
-    
-    def _generate_samples(self):
-        """生成ETH3D数据集的样本列表"""
-        # 确定分割目录
-        split_dir = os.path.join(self.root_dir, self.split)
-        
-        # 确保目录存在
-        if not os.path.exists(split_dir):
-            raise ValueError(f"目录不存在: {split_dir}")
-        
-        # 查找所有场景
-        scenes = [d for d in os.listdir(split_dir) 
-                 if os.path.isdir(os.path.join(split_dir, d))]
-        
-        # 对于每个场景，找到左右图像和视差图
-        for scene in scenes:
-            scene_dir = os.path.join(split_dir, scene)
-            
-            # 左右图像目录
-            left_dir = os.path.join(scene_dir, 'images', 'left')
-            right_dir = os.path.join(scene_dir, 'images', 'right')
-            
-            # 视差图目录
-            disp_dir = os.path.join(scene_dir, 'ground_truth', 'disp_occ')
-            
-            # 查找所有左图像
-            if os.path.exists(left_dir):
-                left_imgs = sorted(glob.glob(os.path.join(left_dir, '*.png')))
-                
-                for left_img_path in left_imgs:
-                    # 提取图像ID
-                    img_id = os.path.basename(left_img_path)
-                    
-                    # 右图像
-                    right_img_path = os.path.join(right_dir, img_id)
-                    if not os.path.exists(right_img_path):
-                        continue
-                    
-                    # 视差图（如果存在）
-                    disp_path = None
-                    if os.path.exists(disp_dir):
-                        disp_path = os.path.join(disp_dir, img_id.replace('.png', '.pfm'))
-                        if not os.path.exists(disp_path):
-                            disp_path = None
-                    
-                    # 添加到样本列表
-                    self.samples.append({
-                        'left': left_img_path,
-                        'right': right_img_path,
-                        'disparity': disp_path,
-                        'scene': scene,
-                        'id': img_id
-                    })
-
-
-class SceneFlowDataset(StereoDataset):
-    """
-    SceneFlow立体视觉数据集
-    
-    该类加载SceneFlow数据集，一个大规模的合成立体视觉数据集。
-    """
-    
-    def __init__(self, 
-                 root_dir,
-                 subset='FlyingThings3D',
-                 split='train',
-                 transform=None, 
-                 augment=False,
-                 max_disp=192,
-                 crop_size=None):
-        """
-        初始化SceneFlow数据集
-        
-        参数:
-            root_dir (str): 数据集根目录
-            subset (str): 子集，'FlyingThings3D', 'Monkaa', 或 'Driving'
-            split (str): 数据集分割，'train' 或 'test'
-            其他参数与StereoDataset基类相同
-        """
-        self.subset = subset
-        super().__init__(root_dir, split, transform, augment, max_disp, crop_size)
-        
-        # 生成样本列表
-        self._generate_samples()
-    
-    def _generate_samples(self):
-        """生成SceneFlow数据集的样本列表"""
-        # 根据子集和分割确定目录
-        if self.subset == 'FlyingThings3D':
-            subset_dir = os.path.join(self.root_dir, 'FlyingThings3D')
-            img_dir = os.path.join(subset_dir, self.split, 'image_clean')
-            disp_dir = os.path.join(subset_dir, self.split, 'disparity')
-        elif self.subset == 'Monkaa':
-            subset_dir = os.path.join(self.root_dir, 'Monkaa')
-            img_dir = os.path.join(subset_dir, 'image_clean')
-            disp_dir = os.path.join(subset_dir, 'disparity')
-        elif self.subset == 'Driving':
-            subset_dir = os.path.join(self.root_dir, 'Driving')
-            img_dir = os.path.join(subset_dir, self.split, 'image_clean')
-            disp_dir = os.path.join(subset_dir, self.split, 'disparity')
-        else:
-            raise ValueError(f"无效的SceneFlow子集: {self.subset}")
-        
-        # 确保目录存在
-        if not os.path.exists(img_dir) or not os.path.exists(disp_dir):
-            raise ValueError(f"目录不存在: {img_dir} 或 {disp_dir}")
-        
-        # 查找所有场景
-        scenes = [d for d in os.listdir(img_dir) 
-                 if os.path.isdir(os.path.join(img_dir, d))]
-        
-        # 对于每个场景，找到左右图像和视差图
-        for scene in scenes:
-            # 找到左右图像文件夹
-            left_dir = os.path.join(img_dir, scene, 'left')
-            right_dir = os.path.join(img_dir, scene, 'right')
-            
-            # 找到视差图文件夹
-            disp_left_dir = os.path.join(disp_dir, scene, 'left')
-            
-            # 检查目录是否存在
-            if not all(os.path.exists(d) for d in [left_dir, right_dir, disp_left_dir]):
-                continue
-            
-            # 查找所有左图像
-            left_imgs = sorted(glob.glob(os.path.join(left_dir, '*.png')))
-            
-            for left_img_path in left_imgs:
-                # 提取图像ID
-                img_id = os.path.basename(left_img_path)
-                
-                # 右图像
-                right_img_path = os.path.join(right_dir, img_id)
-                if not os.path.exists(right_img_path):
-                    continue
-                
-                # 视差图
-                disp_path = os.path.join(disp_left_dir, img_id.replace('.png', '.pfm'))
-                if not os.path.exists(disp_path):
-                    continue
-                
-                # 添加到样本列表
-                self.samples.append({
-                    'left': left_img_path,
-                    'right': right_img_path,
-                    'disparity': disp_path,
-                    'scene': scene,
-                    'id': img_id
-                })
-
-
 class CustomStereoDataset(StereoDataset):
     """
     自定义立体视觉数据集
@@ -637,8 +289,8 @@ class CustomStereoDataset(StereoDataset):
                  disp_dir=None,
                  transform=None, 
                  augment=False,
-                 max_disp=192,
-                 crop_size=None):
+                 max_disp=32,
+                 resize=None):
         """
         初始化自定义数据集
         
@@ -649,7 +301,7 @@ class CustomStereoDataset(StereoDataset):
             transform (callable, optional): 应用于样本的可选变换
             augment (bool): 是否进行数据增强
             max_disp (int): 最大视差值
-            crop_size (tuple): 裁剪尺寸，如 (height, width)
+            resize (tuple): 调整尺寸
         """
         # 不使用StereoDataset的初始化，因为目录结构不同
         self.left_dir = left_dir
@@ -658,7 +310,7 @@ class CustomStereoDataset(StereoDataset):
         self.transform = transform
         self.augment = augment
         self.max_disp = max_disp
-        self.crop_size = crop_size
+        self.resize = resize
         
         # 生成样本列表
         self.samples = []
@@ -712,10 +364,6 @@ class CustomStereoDataset(StereoDataset):
                 'id': img_id
             })
     
-    def __len__(self):
-        """返回数据集中样本数量"""
-        return len(self.samples)
-    
     def __getitem__(self, idx):
         """
         获取数据集中的一个样本
@@ -738,10 +386,8 @@ def get_dataset(config):
         tuple: (train_dataset, val_dataset, test_dataset)
     """
     # 基本变换
-    transform = transforms.Compose([
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                            std=[0.229, 0.224, 0.225])
-    ])
+    transform = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                    std=[0.229, 0.224, 0.225])
     
     # 数据集类型
     dataset_type = config.get('type', 'middlebury')
@@ -750,9 +396,8 @@ def get_dataset(config):
     common_params = {
         'transform': transform,
         'augment': config.get('augment', False),
-        'max_disp': config.get('max_disp', 192),
-        'crop_size': config.get('crop_size', None),
-        'resize_size': config.get('resize_size', None)
+        'max_disp': config.get('max_disp', 32),
+        'resize': config.get('resize', None)
     }
     
     # 根据数据集类型创建数据集
@@ -774,62 +419,6 @@ def get_dataset(config):
             augment=False,  # 测试集不增强
             **{k: v for k, v in common_params.items() if k != 'augment'}
         )
-    
-    elif dataset_type.lower() == 'kitti':
-        train_dataset = KITTIDataset(
-            root_dir=config['root_dir'],
-            split='train',
-            **common_params
-        )
-        val_dataset = KITTIDataset(
-            root_dir=config['root_dir'],
-            split='val',
-            augment=False,
-            **{k: v for k, v in common_params.items() if k != 'augment'}
-        )
-        test_dataset = KITTIDataset(
-            root_dir=config['root_dir'],
-            split='test',
-            augment=False,
-            **{k: v for k, v in common_params.items() if k != 'augment'}
-        )
-    
-    elif dataset_type.lower() == 'eth3d':
-        train_dataset = ETH3DDataset(
-            root_dir=config['root_dir'],
-            split='train',
-            **common_params
-        )
-        val_dataset = ETH3DDataset(
-            root_dir=config['root_dir'],
-            split='val',
-            augment=False,
-            **{k: v for k, v in common_params.items() if k != 'augment'}
-        )
-        test_dataset = ETH3DDataset(
-            root_dir=config['root_dir'],
-            split='test',
-            augment=False,
-            **{k: v for k, v in common_params.items() if k != 'augment'}
-        )
-    
-    elif dataset_type.lower() == 'sceneflow':
-        subset = config.get('subset', 'FlyingThings3D')
-        train_dataset = SceneFlowDataset(
-            root_dir=config['root_dir'],
-            subset=subset,
-            split='train',
-            **common_params
-        )
-        val_dataset = SceneFlowDataset(
-            root_dir=config['root_dir'],
-            subset=subset,
-            split='test',  # SceneFlow没有val分割，使用test
-            augment=False,
-            **{k: v for k, v in common_params.items() if k != 'augment'}
-        )
-        test_dataset = val_dataset  # 使用相同的测试集
-    
     elif dataset_type.lower() == 'custom':
         # 自定义数据集只有一个分割
         dataset = CustomStereoDataset(
@@ -866,7 +455,6 @@ def get_dataset(config):
             train_dataset = None
             val_dataset = None
             test_dataset = dataset
-    
     else:
         raise ValueError(f"不支持的数据集类型: {dataset_type}")
     
@@ -887,10 +475,10 @@ def get_data_loaders(config):
     train_dataset, val_dataset, test_dataset = get_dataset(config)
     
     # 批大小
-    batch_size = config.get('batch_size', 4)
+    batch_size = config.get('batch_size', 1)
     
     # 工作进程数
-    num_workers = config.get('num_workers', 4)
+    num_workers = config.get('num_workers', 2)
     
     # 创建数据加载器
     train_loader = None
